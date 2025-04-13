@@ -15,13 +15,14 @@ from datetime import datetime
 import argparse
 import logging # Import the logging module
 import os
+import concurrent.futures
 import traceback # Needed for logging exceptions
 
 # --- Logging Configuration ---
 # Configure logging to output messages to the console
 # You can adjust the level (e.g., logging.DEBUG) and format as needed
 logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(message)s',
+                    format='%(asctime)s - %(levelname)s - %(thread)d - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     handlers=[
                         logging.FileHandler("jass_log_parser.log"), # Log to a file
@@ -34,11 +35,13 @@ NUM_CARDS_HAND = 9
 NUM_CARDS_TABLE = 3 # Max cards on table in one trick
 NUM_CARDS_HISTORY = 32 # Max cards played before current trick in a round (8 tricks * 4 cards)
 NUM_CARDS_TOTAL_ROUND = 36
+NUM_CARDS_SHOWN = 9 # Max cards shown by a player
 CARD_BITS = 13
 TRUMP_BITS = 6
 STATE_BITS = (NUM_CARDS_HISTORY * CARD_BITS) + \
              (NUM_CARDS_TABLE * CARD_BITS) + \
              (NUM_CARDS_HAND * CARD_BITS) + \
+             (NUM_CARDS_SHOWN * CARD_BITS * 3) + \
              TRUMP_BITS # 32*13 + 4*13 + 9*13 + 6 = 416 + 52 + 117 + 6 = 591 bits
 ACTION_BITS = CARD_BITS # 13 bits for the card played
 # Increased max length for player ID string to avoid truncation
@@ -168,6 +171,7 @@ class State:
                  cards_player: List[Card],
                  cards_table: List[Card],
                  cards_history: List[Card],
+                 cards_shown: List[List[Card]],
                  trump: Trump):
         """
         Initializes the State object, ensuring all card lists are padded
@@ -177,6 +181,7 @@ class State:
         self.cards_player: List[Card] = (cards_player + [Card()] * NUM_CARDS_HAND)[:NUM_CARDS_HAND]
         self.cards_table: List[Card] = (cards_table + [Card()] * NUM_CARDS_TABLE)[:NUM_CARDS_TABLE]
         self.cards_history: List[Card] = (cards_history + [Card()] * NUM_CARDS_HISTORY)[:NUM_CARDS_HISTORY]
+        self.cards_shown: List[List[Card]] = [(shown + [Card()] * NUM_CARDS_SHOWN)[:NUM_CARDS_SHOWN] for shown in cards_shown]
         # --- End Padding ---
 
         self.trump: Trump = trump
@@ -199,6 +204,9 @@ class State:
             state_bits.extend(card.card)
         for card in self.cards_player:  # Always 9 cards (padded)
             state_bits.extend(card.card)
+        for shown_cards in self.cards_shown: # Always 9 cards (padded)
+            for card in shown_cards:
+                state_bits.extend(card.card)
         state_bits.extend(self.trump.value) # 6 bits
 
         # Verification: Check if the final length matches STATE_BITS
@@ -257,6 +265,7 @@ r_newRound = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"a
 r_cardsDealt = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"action\":{\"doDeal\":\s*\d+,\"player\":\s*\d+,\s*\"usernickname\":\s*\"([\w\d]+)\",\"cardset\":\s*\[\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\"\]', re.IGNORECASE)
 r_setTrump = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":{\"submitTrump\":\s*(-?\d+)', re.IGNORECASE)
 r_playCard = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":{\"submitsCard\":\s*\"(\d+)\"', re.IGNORECASE)
+r_cardShow = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":{\"doRequestSuits\":\s*\[".*?;((?:\d+,?)+)"',re.IGNORECASE)
 r_gameEnd = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":\s*\"gameFinished\"}', re.IGNORECASE)
 
 
@@ -298,6 +307,7 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
     # --- Game State Variables (reset per file) ---
     time_last_action: Optional[datetime] = None
     hands: Dict[str, List[Card]] = {} # Current cards in each player's hand
+    shown: List[List[Card]] = {} # Cards shown by each player (so called "Weiss")
     history: List[Card] = [] # Cards from completed tricks in the current round
     table: List[Tuple[str, Card]] = [] # Cards on table in the current trick [(player_id, card), ...]
     current_trick_cards: List[Card] = [] # Just the cards on table for state creation
@@ -380,6 +390,7 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                         # Card numbers start from group 3
                         card_nums = [int(card_str) for card_str in m_deal.groups()[2:]]
                         dealt_cards = [Card(num) for num in card_nums]
+                        shown = [[] for _ in range(4)] # Reset shown cards for all players
 
                         if player_id in hands:
                             hands[player_id] = dealt_cards
@@ -396,6 +407,25 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                         discarded = True
                         break
                     continue
+
+                # Match Card Show
+                m_show = r_cardShow.match(line)
+                if m_show:
+                    try:
+                        player_id = m_show.group(2)
+                        card_nums = [int(card_str) for card_str in m_show.group(3).split(",")]
+
+                        if player_id not in player_ids_in_game:
+                             logging.warning(f"Line {line_count}: Player {player_id} showed cards but not in known players {player_ids_in_game}. Show ignored.")
+                             continue
+
+                        shown[trick_counter-1] = [Card(num) for num in card_nums]
+                        logging.debug(f"Player {player_id} showed cards: {shown[trick_counter-1]}")
+
+                    except (ValueError, IndexError) as e:
+                        logging.error(f"Line {line_count}: Error parsing card show ({e}). Skipping.")
+                    continue
+
 
                 # Match Set Trump
                 m_trump = r_setTrump.match(line)
@@ -426,6 +456,8 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                         player_id = m_play.group(2)
                         card_played_num = int(m_play.group(3))
                         card_played = Card(card_played_num)
+                        card_shown = shown[:trick_counter] + shown[trick_counter+1:] # Exclude the current player
+                        card_shown = card_shown[trick_counter:] + card_shown[:trick_counter] # Rotate to match player order
 
                         
                         # --- Pre-computation Checks ---
@@ -457,7 +489,7 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                         current_history = list(history)
                         current_table_cards_only = list(current_trick_cards)
 
-                        state = State(current_hand, current_table_cards_only, current_history, trump)
+                        state = State(current_hand, current_table_cards_only, current_history, card_shown, trump)
 
                         # --- Create Action ---
                         action = Action(card_played, time_delta_seconds)
@@ -554,7 +586,14 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parse Jass game log files and save state-action pairs to HDF5.")
     parser.add_argument("-i","--input-dir", required=True, help="Directory containing the .game log files.")
     parser.add_argument("-o","--output-file", required=True, help="Path to the output HDF5 file.")
+    parser.add_argument("-n","--num-files", type=int, default=0, help="Number of files to process (0 for all).")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output.")
     args = parser.parse_args()
+
+    # Set logging level based on verbosity
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.debug("Verbose mode enabled. Detailed logs will be shown.")
 
     # Open HDF5 file for appending ('a' mode)
     try:
@@ -565,19 +604,28 @@ if __name__ == "__main__":
                 logging.error(f"Input directory not found or is not a directory: {args.input_dir}")
             else:
                 all_files = os.listdir(args.input_dir)
+
+                if args.num_files > 0:
+                    # Limit the number of files to process
+                    all_files = all_files[:args.num_files]
+                    logging.info(f"Limiting processing to {args.num_files} files.")
+                
                 # Filter for files ending with .game, case-insensitive
                 game_files = [f for f in all_files if f.lower().endswith(".game") and os.path.isfile(os.path.join(args.input_dir, f))]
                 total_game_files = len(game_files)
                 logging.info(f"Found {total_game_files} .game files in {args.input_dir}")
 
-                for i, filename in enumerate(game_files):
-                    full_path = os.path.join(args.input_dir, filename)
-                    # parse_file handles its own file-level errors
-                    parse_file(full_path, hdf5_file)
-                    files_processed_count += 1
-
-                    if (i + 1) % 10 == 0: # Log progress every 10 files
-                        logging.info(f"Processed {i + 1}/{total_game_files} files from {args.input_dir}...")
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    # Process each file in parallel
+                    futures = [executor.submit(parse_file, os.path.join(args.input_dir, filename), hdf5_file) for filename in game_files]
+                    for future in concurrent.futures.as_completed(futures):
+                        try:
+                            future.result() # Wait for the thread to finish
+                            files_processed_count += 1
+                            if files_processed_count % 100 == 0:
+                                logging.info(f"Processed file {files_processed_count}/{total_game_files}")
+                        except Exception as e:
+                            logging.error(f"Error processing file: {e}")
 
             logging.info(f"Finished processing all potential .game files. Processed {files_processed_count} files.")
             logging.info(f"Final HDF5 file saved to: {args.output_file}")

@@ -28,14 +28,17 @@ The decision has been taken to exclude the score, on the basis that it is consid
 +--------------------------------------------------+
 |              Input State (578 bits)              |
 +--------------------------------------------------+
-|  History (32 cards x 12 bits)         | 416 bits |  
+|  History (32 cards x 13 bits)         | 416 bits |  
 |  [ C1 ][ C2 ][ C3 ] ... [ C32 ]       | (32x13)  |
 +--------------------------------------------------+
-|  Current Cards Played (3 x 12)        | 39 bits  |
+|  Current Cards Played (3 x 13)        | 39 bits  |
 |  [ C1 ][ C2 ][ C3 ]                   | (3x13)   |
 +--------------------------------------------------+
-|  Current Cards in Hand (9 x 12)       | 117 bits |
+|  Current Cards in Hand (9 x 13)       | 117 bits |
 |  [ C1 ][ C2 ][ C3 ] ... [ C9 ]        | (9x13)   |
++--------------------------------------------------+
+|  Current Cards in other (4 x 9 x 13)  | 468 bits |
+|  [ C1 ][ C2 ][ C3 ] ... [ C9 ]        | (4x9x13) |
 +--------------------------------------------------+
 |  Trump Suit                           | 6 bits   |
 |  [ TTTTTT ]                           | (6)      |
@@ -43,9 +46,9 @@ The decision has been taken to exclude the score, on the basis that it is consid
 ```
 
 That would give us a input size of: 
-416 (History) + 39 (Current Played) + 117 (Hand) + 6 (Trump) = **578 bits**
+416 (History) + 39 (Current Played) + 117 (Hand) + 468 (other hands) + 6 (Trump) = **1046 bits**
 
-So, the complete input state is a 534-dimensional vector.
+So, the complete input state is a 1046-dimensional vector.
 
 ### Encoding Details
 

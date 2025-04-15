@@ -1,0 +1,25 @@
+Bootstrap: docker
+From: python:3.10-slim
+
+%files
+    requirements.txt /app/requirements.txt
+
+%post
+    apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        python3-dev \
+        python3-pip \
+        git \
+        && rm -rf /var/lib/apt/lists/*
+
+    pip install --upgrade pip
+    pip install -r /app/requirements.txt
+
+%environment
+    export LC_ALL=C.UTF-8
+    export LANG=C.UTF-8
+    export PYTHONUNBUFFERED=1
+    export PATH=/usr/local/bin:$PATH
+
+%runscript
+    echo "Container ready. Run your Python script with: singularity exec <image> python <your_script>.py"

@@ -1,0 +1,8 @@
+h5py
+numpy
+torch
+gymnasium
+scikit-learn
+jupyterlab
+stable-baselines3[extra]
+imitation

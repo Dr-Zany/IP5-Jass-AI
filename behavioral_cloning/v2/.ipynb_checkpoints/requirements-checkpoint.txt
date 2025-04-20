@@ -1,0 +1,36 @@
+# requirements.txt to enable memory-efficient BC training with GPU support
+# using imitation library's DataLoader integration.
+
+# --- Core Libraries ---
+# Imitation library (requires stable-baselines3 and gymnasium)
+# Version 1.0.0 and later generally support data_loader in BC.__init__
+imitation==1.0.0
+
+# Stable-Baselines3 (policy structure used by imitation)
+# Version 2.x.x is compatible with imitation 1.x.x
+stable-baselines3==2.2.1
+
+# Gymnasium (standardized environment spaces)
+# Compatible with recent SB3 and Imitation
+gymnasium==0.29.1
+
+# PyTorch (backend for neural networks)
+# The version below is the standard CPU version.
+# YOU MUST INSTALL THE CORRECT CUDA-ENABLED VERSION SEPARATELY AFTER INSTALLING OTHERS.
+# See instructions below and on the PyTorch website: https://pytorch.org/get-started/locally/
+torch==2.2.2
+
+# --- Data Handling and Utilities ---
+# HDF5 file handling
+h5py==3.10.0
+
+# Numerical operations, base for spaces and data
+numpy==1.26.4
+
+# Data splitting (train/test split)
+scikit-learn==1.4.1
+
+# Progress bar (often pulled by other libraries, but good to include)
+tqdm==4.66.2
+
+jupyterlab

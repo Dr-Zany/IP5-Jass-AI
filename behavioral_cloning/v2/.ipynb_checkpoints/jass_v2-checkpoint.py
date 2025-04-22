@@ -69,7 +69,7 @@ HAND_START_BIT_INDEX = (NUM_CARDS_HISTORY * CARD_BITS) + (NUM_CARDS_TABLE * CARD
 DEFAULT_TRAINING_PARAMS = {
     'validation_split_size': 0.15,
     'random_seed': 42,
-    'bc_batch_size': 32,
+    'bc_batch_size': 128,
     'bc_learning_rate': 3e-4,
     'bc_n_epochs': 10,
     'device': th.device("cuda"),
@@ -101,7 +101,7 @@ def collect_bc_sample_locations_from_hdf5(filepath: str) -> Tuple[Optional[List[
             # Get all group names
             # game_groups = list(f.keys()) # Process all groups
             #game_groups = list(f.keys()) # Process all groups initially
-            game_groups = list(f.keys())# Example: Process only first 2000 games
+            game_groups = list(f.keys()) # Example: Process only first 2000 games
 
             logging.info(f"Found {len(f.keys())} game groups total. Processing {len(game_groups)} groups for locations.")
 
@@ -404,6 +404,8 @@ class BCCardPolicyTrainer:
             shuffle=True, # Shuffle data for better training convergence
             num_workers=self.dataloader_num_workers,
             pin_memory=self.dataloader_pin_memory,
+            drop_last=True, # <--- Add this line
+
         )
         logging.info(f"Created training DataLoader with batch_size={self.bc_batch_size}, num_workers={self.dataloader_num_workers}")
 

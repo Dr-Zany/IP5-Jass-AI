@@ -1,26 +1,21 @@
-# -*- coding: utf-8 -*-
-"""
-Parses Jass game logs and stores state-action pairs efficiently in an HDF5 file.
-Uses standard logging for output.
-Increased PLAYER_ID_MAX_LEN to handle longer IDs.
-"""
-
-import re
-import json
-import h5py
-import numpy as np
-from bitarray import bitarray
-from typing import List, Dict, Any, Optional, Tuple
-from datetime import datetime
 import argparse
-import logging # Import the logging module
+from datetime import datetime
+import h5py
+import re
+import logging
 import os
-import concurrent.futures
-import traceback # Needed for logging exceptions
+import json
+from typing import List, Dict, Any, Optional, Tuple
+
+NUM_CARDS_HAND = 9
+NUM_CARDS_TABLE = 3
+NUM_CARDS_HISTORY = 32
+NUM_CARDS_SHOWN = 27 # 9 cards shown for each player 
+NUM_TRUMPS = 1
+
+NUM_STATE = NUM_CARDS_HAND + NUM_CARDS_TABLE + NUM_CARDS_HISTORY + NUM_CARDS_SHOWN + NUM_TRUMPS # 1 for trump, 9 for each player, 32 for history, 27 for shown cards
 
 # --- Logging Configuration ---
-# Configure logging to output messages to the console
-# You can adjust the level (e.g., logging.DEBUG) and format as needed
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(thread)d - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
@@ -29,262 +24,70 @@ logging.basicConfig(level=logging.INFO,
                         logging.StreamHandler() # Also log to console
                     ])
 
-
-# --- Constants ---
-NUM_CARDS_HAND = 9
-NUM_CARDS_TABLE = 3 # Max cards on table in one trick
-NUM_CARDS_HISTORY = 32 # Max cards played before current trick in a round (8 tricks * 4 cards)
-NUM_CARDS_TOTAL_ROUND = 36
-NUM_CARDS_SHOWN = 9 # Max cards shown by a player
-CARD_BITS = 13
-TRUMP_BITS = 6
-STATE_BITS = (NUM_CARDS_HISTORY * CARD_BITS) + \
-             (NUM_CARDS_TABLE * CARD_BITS) + \
-             (NUM_CARDS_HAND * CARD_BITS) + \
-             (NUM_CARDS_SHOWN * CARD_BITS * 3) + \
-             TRUMP_BITS # 32*13 + 4*13 + 9*13 + 6 = 416 + 52 + 117 + 6 = 591 bits
-ACTION_BITS = CARD_BITS # 13 bits for the card played
-# Increased max length for player ID string to avoid truncation
-
-# --- Class Definitions ---
-
-class Card:
-    """
-    Represents a Jass card using a 13-bit bitarray.
-
-    Bits 0-8: Value (6, 7, 8, 9, 10, Jack, Queen, King, Ace)
-    Bits 9-12: Suit (Hearts, Diamonds, Clubs, Spades)
-    """
-    def __init__(self, card_num: Optional[int] = None):
-        """
-        Initializes a Card object.
-
-        Args:
-            card_num: An integer from 0 to 35 representing the card,
-                      or None to create an empty/invalid card (all bits 0).
-                      Mapping:
-                      0-8: Hearts (6-Ace)
-                      9-17: Diamonds (6-Ace)
-                      18-26: Clubs (6-Ace)
-                      27-35: Spades (6-Ace)
-        """
-        self.card = bitarray(CARD_BITS)
-        self.card.setall(0) # Initialize as an empty card
-        if card_num is not None and 0 <= card_num < NUM_CARDS_TOTAL_ROUND:
-            value_index = card_num % NUM_CARDS_HAND # 0-8
-            suit_index = (card_num // NUM_CARDS_HAND) + NUM_CARDS_HAND # 9-12
-            # Check indices are valid before setting bits
-            if 0 <= value_index < NUM_CARDS_HAND and NUM_CARDS_HAND <= suit_index < CARD_BITS:
-                self.card[value_index] = 1
-                self.card[suit_index] = 1
-            else:
-                # This case should ideally not happen with valid card_num input
-                logging.warning(f"Invalid card indices derived from card_num {card_num}.")
-
-
-    def to_array(self) -> np.ndarray:
-        """Converts the card's bitarray to a NumPy boolean array."""
-        return np.array(self.card.tolist(), dtype=bool)
-
-    @classmethod
-    def from_array(cls, arr: np.ndarray) -> 'Card':
-        """Creates a Card object from a NumPy boolean array."""
-        instance = cls()
-        if arr.size == CARD_BITS:
-             instance.card = bitarray(arr.tolist())
-        else:
-             logging.warning(f"Array size mismatch in Card.from_array. Expected {CARD_BITS}, got {arr.size}.")
-             # Keep the default empty card
-        return instance
-
-    def is_empty(self) -> bool:
-        """Checks if the card is an empty card (all bits zero)."""
-        return not self.card.any()
-
-    def __repr__(self) -> str:
-        return f"Card({self.card.to01()})"
-
-class Trump:
-    """
-    Represents the trump suit using a 6-bit bitarray.
-
-    Bit 0: Hearts
-    Bit 1: Diamonds
-    Bit 2: Clubs
-    Bit 3: Spades
-    Bit 4: Bottom-up (Undeufe)
-    Bit 5: Top-down (Obenabe)
-    """
-    def __init__(self, trump_num: Optional[int] = None):
-        """
-        Initializes the Trump object.
-
-        Args:
-            trump_num: An integer 0-5 representing the trump suit,
-                       or None for no trump initially.
-                       Handles trump 7 (switch) separately.
-        """
-        self.value = bitarray(TRUMP_BITS)
-        self.value.setall(0)
-        if trump_num is not None and 0 <= trump_num < TRUMP_BITS:
-            self.value[trump_num] = 1
-
-    def set_trump(self, trump_num: int) -> None:
-        """Sets the trump suit. Returns True if it was a 'switch'."""
-        self.value.setall(0)
-        if trump_num == -1: # No trump selected yet / Pass
-            pass # Pass to m8
-        elif 0 <= trump_num < TRUMP_BITS:
-            self.value[trump_num] = 1
-        else:
-            logging.warning(f"Invalid trump_num {trump_num} passed to set_trump.")
-
-    def to_array(self) -> np.ndarray:
-        """Converts the trump bitarray to a NumPy boolean array."""
-        return np.array(self.value.tolist(), dtype=bool)
-
-    @classmethod
-    def from_array(cls, arr: np.ndarray) -> 'Trump':
-        """Creates a Trump object from a NumPy boolean array."""
-        instance = cls()
-        if arr.size == TRUMP_BITS:
-            instance.value = bitarray(arr.tolist())
-        else:
-            logging.warning(f"Array size mismatch in Trump.from_array. Expected {TRUMP_BITS}, got {arr.size}.")
-        return instance
-
-    def __repr__(self) -> str:
-        return f"Trump({self.value.to01()})"
-
-class State:
-    """
-    Represents the game state from the perspective of one player *before* they play.
-
-    Includes fixed-size representations of:
-    - History: Cards played in completed tricks this round (padded to 32).
-    - Table: Cards played in the current trick *before* this player (padded to 4).
-    - Hand: Cards currently in the player's hand (padded to 9).
-    - Trump: The current trump suit.
-    - Player ID: The ID of the player whose perspective this is.
-    """
-    def __init__(self,
-                 cards_player: List[Card],
-                 cards_table: List[Card],
-                 cards_history: List[Card],
-                 cards_shown: List[List[Card]],
-                 trump: Trump):
-        """
-        Initializes the State object, ensuring all card lists are padded
-        to their fixed maximum sizes with empty Card objects.
-        """
-        # --- Padding Logic ---
-        self.cards_player: List[Card] = (cards_player + [Card()] * NUM_CARDS_HAND)[:NUM_CARDS_HAND]
-        self.cards_table: List[Card] = (cards_table + [Card()] * NUM_CARDS_TABLE)[:NUM_CARDS_TABLE]
-        self.cards_history: List[Card] = (cards_history + [Card()] * NUM_CARDS_HISTORY)[:NUM_CARDS_HISTORY]
-        self.cards_shown: List[List[Card]] = [(shown + [Card()] * NUM_CARDS_SHOWN)[:NUM_CARDS_SHOWN] for shown in cards_shown]
-        # --- End Padding ---
-
-        self.trump: Trump = trump
-
-    def to_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Converts the state into NumPy arrays suitable for saving.
-
-        Returns:
-            A tuple containing:
-            - state_bits (np.ndarray): Boolean array of size STATE_BITS, concatenating
-                                       history, table, hand, and trump bits.
-            - player_id_arr (np.ndarray): NumPy array holding the player ID as bytes.
-        """
-        state_bits = bitarray()
-        # Extend with history, table, hand, and trump bits in order
-        for card in self.cards_history: # Always 32 cards (padded)
-            state_bits.extend(card.card)
-        for card in self.cards_table:   # Always 3 cards (padded)
-            state_bits.extend(card.card)
-        for card in self.cards_player:  # Always 9 cards (padded)
-            state_bits.extend(card.card)
-        for shown_cards in self.cards_shown: # Always 9 cards (padded)
-            for card in shown_cards:
-                state_bits.extend(card.card)
-        state_bits.extend(self.trump.value) # 6 bits
-
-        # Verification: Check if the final length matches STATE_BITS
-        if len(state_bits) != STATE_BITS:
-             # This should not happen if constants and padding are correct.
-             logging.error(f"State bit length mismatch! Expected {STATE_BITS}, got {len(state_bits)}. Check constants and padding.")
-             # Handle error appropriately, maybe raise exception or return invalid data
-             # For now, pad/truncate defensively, but this indicates a bug.
-             state_bits.extend([0] * (STATE_BITS - len(state_bits)))
-             state_bits = state_bits[:STATE_BITS]
-
-
-        state_array = np.array(state_bits.tolist(), dtype=bool)
-        return state_array
-
-    def __repr__(self) -> str:
-        # Count non-empty cards for a more informative representation
-        hand_count = sum(1 for card in self.cards_player if not card.is_empty())
-        table_count = sum(1 for card in self.cards_table if not card.is_empty())
-        history_count = sum(1 for card in self.cards_history if not card.is_empty())
-        return (f"State(Player: {self.player_id}, Hand: {hand_count}/{NUM_CARDS_HAND}, "
-                f"Table: {table_count}/{NUM_CARDS_TABLE}, History: {history_count}/{NUM_CARDS_HISTORY}, Trump: {self.trump})")
-
-
-class Action:
-    """
-    Represents the action taken by a player.
-
-    Includes:
-    - Card Played: The card played by the player.
-    - Time To Play: Time elapsed in seconds since the last action.
-    """
-    def __init__(self, card_played: Card, time_to_play: float):
-        self.card_played: Card = card_played
-        self.time_to_play: float = max(0.0, time_to_play) # Ensure time is not negative
-
-    def to_arrays(self) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Converts the action into NumPy arrays suitable for saving.
-
-        Returns:
-            A tuple containing:
-            - card_bits (np.ndarray): Boolean array of size CARD_BITS for the card.
-            - time_arr (np.ndarray): Float array containing the time to play.
-        """
-        card_array = self.card_played.to_array()
-        time_array = np.array([self.time_to_play], dtype=float)
-        return card_array, time_array
-
-    def __repr__(self) -> str:
-        return f"Action(Card: {self.card_played}, Time: {self.time_to_play:.2f}s)"
-
 # --- Regex Definitions ---
 r_playerInfo = re.compile(r'\"usernickname\":\s*\"([\w\d]+)\".*?\"eq\":\s*(\d+).*?\"iq\":\s*(\d+).*?\"niceness\":\s*(\d+).*?\"honness\":\s*(\d+).*?\"winness\":\s*(\d+).*?\"playedgames\":\s*(\d+).*?\"profival\":\s*(\d+)', re.IGNORECASE)
 r_newRound = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"action\":{\"newRound\": \"Runde (\d+)\"', re.IGNORECASE)
-r_cardsDealt = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"action\":{\"doDeal\":\s*\d+,\"player\":\s*\d+,\s*\"usernickname\":\s*\"([\w\d]+)\",\"cardset\":\s*\[\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\"\]', re.IGNORECASE)
+r_cardsDealt = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"action\":{\"doDeal\":\s*(\d+),\"player\":\s*\d+,\s*\"usernickname\":\s*\"([\w\d]+)\",\"cardset\":\s*\[\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\",\"(\d+)\"\]', re.IGNORECASE)
 r_setTrump = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":{\"submitTrump\":\s*(-?\d+)', re.IGNORECASE)
 r_playCard = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":{\"submitsCard\":\s*\"(\d+)\"', re.IGNORECASE)
 r_cardShow = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":{\"doRequestSuits\":\s*\[".*?;((?:\d+,?)+)"',re.IGNORECASE)
 r_gameEnd = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":\s*\"gameFinished\"}', re.IGNORECASE)
 
-
-
-# --- Parsing Function ---
-
-def parse_file(filename: str, hdf5_file: h5py.File) -> None:
+# --- State Functions ---
+def create_state(hand: List[int], table: List[int], history: List[int], shown: List[List[int]], trump: int) -> List[int]:
     """
-    Parses a Jass log file and saves state-action pairs to an HDF5 file.
+    Create a state representation for the Jass game.
 
     Args:
-        filename: Path to the log file.
-        hdf5_file: An opened h5py.File object for writing.
-    """
-    # Extract a base name for the HDF5 group
-    base_filename = os.path.basename(filename) # Use os.path.basename for safety
-    game_group_name = os.path.splitext(base_filename)[0] # Use os.path.splitext
+        hand (List[int]): Cards in hand.
+        table (List[int]): Cards on the table.
+        history (List[int]): Cards in history.
+        shown (List[List[int]]): Cards shown by each player.
+        trump (int): Trump suit.
 
-    # Reset game-specific state for each file
+    Returns:
+        List[int]: State representation as a list of integers.
+    """
+    state = []
+    state += history + [0] * (NUM_CARDS_HISTORY - len(history)) # Fill with zeros if history is shorter than expected
+    state += table + [0] * (NUM_CARDS_TABLE - len(table)) # Fill with zeros if table is shorter than expected
+    state += hand + [0] * (NUM_CARDS_HAND - len(hand)) # Fill with zeros if hand is shorter than expected
+    for shown_cards in shown:
+        state += shown_cards + [0] * (9 - len(shown_cards))
+    state += [trump] # Add trump value
+    if len(state) != NUM_STATE:
+        logging.error(f"State length mismatch: expected {NUM_STATE}, got {len(state)}")
+        raise ValueError(f"State length mismatch: expected {NUM_STATE}, got {len(state)}")
+
+    return state
+
+def create_action(card: int, hand: list[int]) -> int:
+    """
+    Create an action representation for the Jass game.
+
+    Args:
+        card (int): Card played.
+        hand (list[int]): Cards in hand.
+
+    Returns:
+        int: Action representation as an integer.
+    """
+    return hand.index(card) if card in hand else -1
+
+
+# --- Parser Functions ---
+def parse_file(file_path: str, hdf5_file: h5py.File) -> int:
+    """
+    Parse the Jass log file and store the data in an HDF5 file.
+
+    Args:
+        file_path (str): Path to the Jass log file.
+        hdf5_file (h5py.file): HDF5 file object to store the parsed data.
+    """
+
+    file_name = os.path.basename(file_path)
+    game_group_name = os.path.splitext(file_name)[0] 
+
     player_infos: List[Dict[str, Any]] = []
     player_ids_in_game: List[str] = []
     found_all_players = False # Flag to track if player info is complete for this game
@@ -295,26 +98,24 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
     group = hdf5_file.create_group(game_group_name)
     logging.debug(f"Created HDF5 group: /{game_group_name}")
 
-    # --- HDF5 Dataset Initialization ---
-    # Create resizable datasets with chunking for better I/O performance
-    dset_state_bits = group.create_dataset("state_bits", (0, STATE_BITS), maxshape=(None, STATE_BITS), dtype='bool', chunks=(128, STATE_BITS), compression="gzip")
-    dset_state_player = group.create_dataset("state_player_id", (0,), maxshape=(None,), dtype=f'uint8', chunks=(128,), compression="gzip")
 
-    # Action data
-    dset_action_card = group.create_dataset("action_card_bits", (0, ACTION_BITS), maxshape=(None, ACTION_BITS), dtype='bool', chunks=(128, ACTION_BITS), compression="gzip")
-    dset_action_time = group.create_dataset("action_time", (0,), maxshape=(None,), dtype='float', chunks=(128,), compression="gzip")
+    dset_state = group.create_dataset("state", (0, NUM_STATE), maxshape=(None, NUM_STATE), chunks=True, dtype='uint8', compression="gzip")
+    dset_player_info = group.create_dataset("player_id", (0,1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
 
-    # --- Game State Variables (reset per file) ---
+    dset_action = group.create_dataset("action", (0,1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
+    dest_time = group.create_dataset("time", (0,1), maxshape=(None, 1), chunks=True, dtype='float', compression="gzip")
+
     time_last_action: Optional[datetime] = None
-    hands: Dict[str, List[Card]] = {} # Current cards in each player's hand
-    shown: List[List[Card]] = {} # Cards shown by each player (so called "Weiss")
-    history: List[Card] = [] # Cards from completed tricks in the current round
-    table: List[Tuple[str, Card]] = [] # Cards on table in the current trick [(player_id, card), ...]
-    current_trick_cards: List[Card] = [] # Just the cards on table for state creation
+    player_order: Dict[str, int] = {} # Maps player IDs to their order in the game
+    hands: Dict[str, List[int]] = {} # Current cards in each player's hand
+    shown: List[List[int]] = {} # Cards shown by each player (so called "Weiss")
+    history: List[int] = [] # Cards from completed tricks in the current round
+    table: List[Tuple[str, int]] = [] # Cards on table in the current trick [(player_id, card), ...]
+    current_trick_cards: List[int] = [] # Just the cards on table for state creation
     round_number: int = 0
     trick_counter: int = 0 # Counts cards played in the current trick (0-3)
     round_card_counter: int = 0 # Counts total cards played in the round (0-35)
-    trump: Trump = Trump() # Current trump suit
+    trump: int = 0 # Current trump suit
 
     logging.debug(f"Processing file: {filename}")
     line_count = 0
@@ -323,7 +124,7 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
     discarded = False
 
     try:
-        with open(filename, 'r', encoding='utf-8') as f:
+        with open(file_path, 'r', encoding='utf-8') as f:
             for i, line in enumerate(f):
                 line_count = i + 1
                 line = line.strip()
@@ -378,7 +179,9 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                     current_trick_cards = []
                     trick_counter = 0
                     round_card_counter = 0
-                    trump = Trump() # Reset trump
+                    trump = 0
+                    player_order = {}
+                    shown = [[] for _ in range(4)]
                     continue
 
                 # Match Cards Dealt
@@ -386,14 +189,13 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                 if m_deal:
                     try:
                         deal_time = datetime.strptime(m_deal.group(1), "%Y-%m-%d %H:%M:%S%z")
-                        player_id = m_deal.group(2)
+                        player_id = m_deal.group(3)
+                        player_order[player_id] = 3 - int(m_deal.group(2)) # Player ID and their order in the game
                         # Card numbers start from group 3
-                        card_nums = [int(card_str) for card_str in m_deal.groups()[2:]]
-                        dealt_cards = [Card(num) for num in card_nums]
-                        shown = [[] for _ in range(4)] # Reset shown cards for all players
+                        card_nums = [int(card_str) + 1 for card_str in m_deal.groups()[3:]]
 
                         if player_id in hands:
-                            hands[player_id] = dealt_cards
+                            hands[player_id] = card_nums
                             # Update time_last_action if this is the most recent event
                             if time_last_action is None or deal_time > time_last_action:
                                 time_last_action = deal_time
@@ -413,14 +215,14 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                 if m_show:
                     try:
                         player_id = m_show.group(2)
-                        card_nums = [int(card_str) for card_str in m_show.group(3).split(",")]
+                        card_nums = [int(card_str) + 1 for card_str in m_show.group(3).split(",")]
 
                         if player_id not in player_ids_in_game:
                              logging.warning(f"Line {line_count}: Player {player_id} showed cards but not in known players {player_ids_in_game}. Show ignored.")
                              continue
 
-                        shown[trick_counter-1] = [Card(num) for num in card_nums]
-                        logging.debug(f"Player {player_id} showed cards: {shown[trick_counter-1]}")
+                        shown[player_order[player_id]] = card_nums # Store shown cards in the order of player IDs
+                        logging.debug(f"Player {player_id} showed cards: {shown[-1]}")
 
                     except (ValueError, IndexError) as e:
                         logging.error(f"Line {line_count}: Error parsing card show ({e}). Skipping.")
@@ -433,14 +235,14 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                     try:
                         trump_time = datetime.strptime(m_trump.group(1), "%Y-%m-%d %H:%M:%S%z")
                         player_id = m_trump.group(2)
-                        trump_val = int(m_trump.group(3))
+                        trump_val = int(m_trump.group(3)) + 1
 
                         if player_id not in player_ids_in_game:
                              logging.warning(f"Line {line_count}: Player {player_id} set trump but not in known players {player_ids_in_game}. Trump setting ignored.")
                              continue
 
                         logging.debug(f"Player {player_id} sets trump to {trump_val}")
-                        trump.set_trump(trump_val)
+                        trump = trump_val
 
                         if time_last_action is None or trump_time > time_last_action:
                              time_last_action = trump_time
@@ -452,12 +254,19 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                 m_play = r_playCard.match(line)
                 if m_play:
                     try:
+
                         time_new_action = datetime.strptime(m_play.group(1), "%Y-%m-%d %H:%M:%S%z")
                         player_id = m_play.group(2)
-                        card_played_num = int(m_play.group(3))
-                        card_played = Card(card_played_num)
-                        card_shown = shown[:trick_counter] + shown[trick_counter+1:] # Exclude the current player
-                        card_shown = card_shown[trick_counter:] + card_shown[:trick_counter] # Rotate to match player order
+                        card_played = int(m_play.group(3)) + 1
+
+                        if player_id not in player_order:
+                            logging.warning(f"Line {line_count}: Player {player_id} played card but player order is not known {player_order}.")
+                            discarded = True
+                            break
+
+                        # creating shown cards in the order of player ids
+                        card_shown = shown[:player_order[player_id]] + shown[player_order[player_id]+1:] # Exclude the current player
+                        card_shown = card_shown[player_order[player_id]:] + card_shown[:player_order[player_id]] # Rotate to match player order
 
                         
                         # --- Pre-computation Checks ---
@@ -470,7 +279,7 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                             discarded = True
                             break
                         if not hands[player_id]: # Check if hand is unexpectedly empty
-                            logging.warning(f"Line {line_count}: Player {player_id} attempting to play card {card_played_num} but hand is recorded as empty. Skipping state save. {filename}")
+                            logging.warning(f"Line {line_count}: Player {player_id} attempting to play card {card_played} but hand is recorded as empty. Skipping state save. {filename}")
                             discarded = True
                             break
                         if time_last_action is None:
@@ -489,39 +298,37 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                         current_history = list(history)
                         current_table_cards_only = list(current_trick_cards)
 
-                        state = State(current_hand, current_table_cards_only, current_history, card_shown, trump)
+                        state = create_state(current_hand, current_table_cards_only, current_history, card_shown, trump)
 
                         # --- Create Action ---
-                        action = Action(card_played, time_delta_seconds)
+                        action = create_action(card_played, current_hand)
 
                         # --- Save State and Action to HDF5 ---
-                        state_arr = state.to_arrays()
-                        action_card_arr, action_time_arr = action.to_arrays()
 
                         # Resize datasets before appending
-                        current_size = dset_state_bits.shape[0]
-                        dset_state_bits.resize(current_size + 1, axis=0)
-                        dset_state_player.resize(current_size + 1, axis=0)
-                        dset_action_card.resize(current_size + 1, axis=0)
-                        dset_action_time.resize(current_size + 1, axis=0)
+                        current_size = dset_state.shape[0]
+                        dset_state.resize(current_size + 1, axis=0)
+                        dset_player_info.resize(current_size + 1, axis=0)
+                        dset_action.resize(current_size + 1, axis=0)
+                        dest_time.resize(current_size + 1, axis=0)
 
                         # Append data to the last row
-                        dset_state_bits[current_size, :] = state_arr
-                        dset_state_player[current_size] = list(hands.keys()).index(player_id)
-                        dset_action_card[current_size, :] = action_card_arr
-                        dset_action_time[current_size] = action_time_arr[0]
+                        dset_state[current_size:] = state
+                        dset_player_info[current_size] = list(hands.keys()).index(player_id)
+                        dset_action[current_size:] = action
+                        dest_time[current_size] = time_delta_seconds
 
                         saved_states += 1
 
                         # --- Update Game State AFTER saving ---
                         card_found_in_hand = False
                         for idx, hand_card in enumerate(hands[player_id]):
-                            if hand_card.card == card_played.card:
+                            if hand_card == card_played:
                                 del hands[player_id][idx]
                                 card_found_in_hand = True
                                 break
                         if not card_found_in_hand:
-                            logging.warning(f"Line {line_count}: Card {card_played_num} ({card_played}) played by {player_id} was not found in their current hand!")
+                            logging.warning(f"Line {line_count}: Card ({card_played}) played by {player_id} was not found in their current hand!")
                             logging.warning(f"  Current hand state before play: {[c for c in current_hand]}")
                             # Attempt to continue, but state might be inconsistent
 
@@ -541,7 +348,7 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                             trick_counter = 0
 
                         # Check if round is complete
-                        if round_card_counter == NUM_CARDS_TOTAL_ROUND:
+                        if round_card_counter == 36:
                              logging.debug(f"--- Round {round_number} Complete ---")
                              # State resets automatically on next 'newRound' match
 
@@ -549,6 +356,8 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                          logging.error(f"Line {line_count}: Failed to process card play for player {m_play.group(2)} card {m_play.group(3)} ({e}). Skipping.")
                          logging.debug(f"  Problematic line: {line}")
                          logging.exception("Traceback:")
+                         discarded = True
+                         break # Critical error, break out of loop
                     continue # Ensure we move to the next line even if errors 
                 
                 # Match Game End
@@ -558,13 +367,13 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
                     break # End of file reached, break out of loop
 
     except FileNotFoundError:
-        logging.error(f"Log file not found at '{filename}'")
-        return # Skip this file
+        logging.error(f"File '{filename}' not found. Skipping.")
+        discarded = True
     except Exception as e:
         logging.error(f"An unexpected error occurred while processing file '{filename}' at line ~{line_count}: {e}")
         logging.exception("Traceback:")
         # Decide if you want to stop processing this file or continue
-        return # Stop processing this file on major errors
+        discarded = True
 
     # Add final attributes after processing the file
     group.attrs['total_states_saved'] = saved_states
@@ -578,7 +387,11 @@ def parse_file(filename: str, hdf5_file: h5py.File) -> None:
 
     if discarded:
         logging.warning(f"Discarded file {filename} due to critical errors. No data saved.")
-        del group # Remove the group if no valid data was saved
+        del hdf5_file[game_group_name] # Remove the group from HDF5 file
+        return 0 # Skip this file
+    
+    hdf5_file.flush() # Ensure changes are written to disk
+    return saved_states # Return the number of states saved for this file
 
 
 # --- Main Execution ---
@@ -595,41 +408,24 @@ if __name__ == "__main__":
         logging.getLogger().setLevel(logging.DEBUG)
         logging.debug("Verbose mode enabled. Detailed logs will be shown.")
 
-    # Open HDF5 file for appending ('a' mode)
     try:
         with h5py.File(args.output_file, 'a') as hdf5_file:
-            logging.info(f"Opened HDF5 file: {args.output_file} in append mode.")
-            files_processed_count = 0
-            if not os.path.isdir(args.input_dir):
-                logging.error(f"Input directory not found or is not a directory: {args.input_dir}")
-            else:
-                all_files = os.listdir(args.input_dir)
+            input_files = [f for f in os.listdir(args.input_dir) if f.endswith('.game')]
+            num_states = 0
+            if args.num_files > 0:
+                input_files = input_files[:args.num_files]
+            counter = 0
+            for filename in input_files:
+                file_path = os.path.join(args.input_dir, filename)
+                num_states += parse_file(file_path, hdf5_file)
+                counter += 1
+                if counter % 100 == 0:
+                    logging.info(f"Processed {counter} files of {len(input_files)}. Total states saved so far: {num_states}")
 
-                if args.num_files > 0:
-                    # Limit the number of files to process
-                    all_files = all_files[:args.num_files]
-                    logging.info(f"Limiting processing to {args.num_files} files.")
-                
-                # Filter for files ending with .game, case-insensitive
-                game_files = [f for f in all_files if f.lower().endswith(".game") and os.path.isfile(os.path.join(args.input_dir, f))]
-                total_game_files = len(game_files)
-                logging.info(f"Found {total_game_files} .game files in {args.input_dir}")
+            logging.info(f"Total states saved: {num_states}")
 
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # Process each file in parallel
-                    futures = [executor.submit(parse_file, os.path.join(args.input_dir, filename), hdf5_file) for filename in game_files]
-                    for future in concurrent.futures.as_completed(futures):
-                        try:
-                            future.result() # Wait for the thread to finish
-                            files_processed_count += 1
-                            if files_processed_count % 100 == 0:
-                                logging.info(f"Processed file {files_processed_count}/{total_game_files}")
-                        except Exception as e:
-                            logging.error(f"Error processing file: {e}")
-
-            logging.info(f"Finished processing all potential .game files. Processed {files_processed_count} files.")
-            logging.info(f"Final HDF5 file saved to: {args.output_file}")
-
+            hdf5_file.attrs['total_states_saved'] = num_states
+    
     except Exception as e:
         # Catch errors related to opening/writing the HDF5 file itself
         logging.critical(f"Failed to open or write to HDF5 file {args.output_file}: {e}")

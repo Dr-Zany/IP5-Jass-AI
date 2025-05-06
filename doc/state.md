@@ -89,7 +89,7 @@ So, the complete input state is a 2527-dimensional vector.
    - The order of cards from Ace to 6 means Ace is the highest dimension and 6 is the lowest dimension. 
 
 - **6-Bit Vectore Trump:**
-   Trump is endcode with 6 bits:
+   Trump is endcode with 6 dimensions, where each dimension corresponds to a specific trump suit. The encoding is as follows:
    ```
    +------------------+    
    | 6:  Top-down  ↓  |
@@ -158,3 +158,6 @@ jass_datset.hdf5/
 
 ### State
 - The state is a 72 indices structure like the input state.
+
+### Action
+- Is the index of the card played in the hand.

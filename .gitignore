@@ -4,3 +4,5 @@ __pycache__
 *.log
 *.hdf5
 */logs_bc/*
+*.pth
+*.onnx

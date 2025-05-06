@@ -1,215 +1,347 @@
-import os
-import numpy as np
-import h5py
-import gymnasium as gym
-from gymnasium import spaces
 import torch
 import torch.nn as nn
-from stable_baselines3.common.policies import ActorCriticPolicy
-from stable_baselines3.common.env_checker import check_env
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from stable_baselines3.common.monitor import Monitor
-from stable_baselines3.common.vec_env import DummyVecEnv
-from imitation.data import types, rollout
-from imitation.util import logger as imit_logger
-from imitation.algorithms.bc import BC
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
+import h5py
+import random
+import numpy as np
+from tqdm import tqdm
+import os
+import csv # Import the csv module
 
-# --- Feature Extractor ---
-class JassFeatureExtractor(BaseFeaturesExtractor):
-    """Custom feature extractor for Jass observations using an embedding layer."""
-    def __init__(self, observation_space, embedding_dim=16):
-        n_cards = 37  # 36 cards + 1 for 'none'
-        features_dim = int(np.prod(observation_space.shape)) * embedding_dim
-        super().__init__(observation_space, features_dim)
-        self.embedding = nn.Embedding(n_cards, embedding_dim)
+# Define a seed for reproducibility
+MANUAL_SEED = 42
 
-    def forward(self, observations):
-        x = observations.long()
-        embedded = self.embedding(x)
-        return embedded.view(x.shape[0], -1)
+def set_seed(seed):
+    """Set seeds for reproducibility."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed) # Set seed for all GPUs
+    torch.backends.cudnn.deterministic = True # Ensure deterministic behavior
+    torch.backends.cudnn.benchmark = False # Disable cudnn benchmark for reproducibility
 
-# --- Environment ---
-class JassEnv(gym.Env):
-    """Custom Gym environment for Jass game episodes loaded from HDF5."""
-    metadata = {"render_modes": [], "render_fps": 1}
+class JassDataset(Dataset):
+    """
+    Custom Dataset for loading Jass game states and actions from an HDF5 file.
+    """
+    def __init__(self, h5_path):
+        """
+        Initializes the dataset by opening the HDF5 file and indexing samples.
 
-    def __init__(self, hdf5_path, groups, rng=None):
-        super().__init__()
-        self.hdf5_path = hdf5_path
-        self.hdf5 = h5py.File(hdf5_path, 'r')
-        self.groups = list(groups)
-        self.rng = rng or np.random.default_rng()
-        # Discrete card IDs for 72 positions
-        self.observation_space = spaces.Box(low=0, high=36, shape=(72,), dtype=np.uint8)
-        self.action_space = spaces.Discrete(9)
-        self.last_obs = None
-        self._load_new_episode()
+        Args:
+            h5_path (str): Path to the HDF5 file containing game data.
+        """
+        self.file = h5py.File(h5_path, 'r')
+        self.groups = list(self.file.keys())
+        self.index = []
+        # Create a flat index of (group, sample_index_within_group) tuples
+        for g in self.groups:
+            n = self.file[g]['state'].shape[0]
+            for i in range(n):
+                self.index.append((g, i))
 
-    def _load_new_episode(self):
-        if not self.groups:
-            raise RuntimeError("No groups available to load an episode.")
-        self.current_group_name = self.rng.choice(self.groups)
-        grp = self.hdf5[self.current_group_name]
-        self.current_group_data = {
-            'states': grp['state'][:].astype(np.uint8),
-            'actions': grp['action'][:].astype(np.uint8)
-        }
-        self.total_steps_in_group = len(self.current_group_data['states'])
-        if self.total_steps_in_group == 0:
-            self.groups.remove(self.current_group_name)
-            return self._load_new_episode()
-        self.current_index_in_group = 0
-        self.last_obs = self.current_group_data['states'][0]
+    def __len__(self):
+        """
+        Returns the total number of samples in the dataset.
+        """
+        return len(self.index)
 
-    def reset(self, seed=None, options=None):
-        super().reset(seed=seed)
-        self._load_new_episode()
-        obs = self.current_group_data['states'][0]
-        self.last_obs = obs
-        return obs, {}
+    def __getitem__(self, idx):
+        """
+        Retrieves a sample (state and action) by its index.
 
-    def step(self, action):
-        if self.current_index_in_group >= self.total_steps_in_group:
-            raise RuntimeError("Step called after episode ended.")
-        expert_action = self.current_group_data['actions'][self.current_index_in_group]
-        reward = 1.0 if action == expert_action else 0.0
-        self.current_index_in_group += 1
-        terminated = self.current_index_in_group >= self.total_steps_in_group
-        if not terminated:
-            obs = self.current_group_data['states'][self.current_index_in_group]
-            self.last_obs = obs
-        else:
-            obs = self.last_obs
-        return obs, reward, terminated, False, {'expert_action': expert_action}
+        Args:
+            idx (int): Index of the sample to retrieve.
+
+        Returns:
+            tuple: A tuple containing the state tensor and action tensor.
+        """
+        grp, i = self.index[idx]
+        state = self.file[grp]['state'][i]
+        action = self.file[grp]['action'][i]
+        state_tensor = torch.LongTensor(state)
+
+        # Clamp card indices to be within the valid range [0, 70]
+        # The last element is the trump index, which is handled separately.
+        # Assuming card indices are the first 71 elements.
+        if state_tensor.size(0) > 71: # Ensure there are card indices to clamp
+             state_tensor[:71].clamp_(0, 70) # Clamp the first 71 elements (card indices)
+        elif state_tensor.size(0) == 71: # If only card indices are present
+             state_tensor.clamp_(0, 70)
+
+
+        return state_tensor, torch.tensor(action, dtype=torch.long)
 
     def close(self):
-        if hasattr(self, 'hdf5') and self.hdf5:
-            self.hdf5.close()
-            self.hdf5 = None
+        """
+        Closes the HDF5 file. Should be called when done with the dataset.
+        """
+        self.file.close()
 
-    def __del__(self):
-        self.close()
 
-# --- Data Loader ---
-def load_transitions(hdf5_path, groups):
-    all_obs, all_acts, all_infos, all_dones = [], [], [], []
-    with h5py.File(hdf5_path, 'r') as f:
-        for group_name in groups:
-            try:
-                grp = f[group_name]
-                states = grp['state'][:].astype(np.uint8)
-                acts = grp['action'][:].astype(np.uint8)
-                if len(states) != len(acts) or len(states) == 0:
-                    continue
-                all_obs.append(states)
-                all_acts.append(acts)
-                all_infos.extend([{}] * len(states))
-                dones = np.zeros(len(states), dtype=bool)
-                dones[-1] = True
-                all_dones.append(dones)
-            except Exception:
-                continue
-    if not all_obs:
-        raise ValueError("No valid transitions loaded.")
-    obs_arr = np.concatenate(all_obs)
-    acts_arr = np.concatenate(all_acts)
-    dones_arr = np.concatenate(all_dones)
-    next_obs_arr = np.roll(obs_arr, -1, axis=0)
-    next_obs_arr[dones_arr] = obs_arr[dones_arr]
-    return types.Transitions(
-        obs=obs_arr,
-        acts=acts_arr,
-        infos=np.array(all_infos),
-        next_obs=next_obs_arr,
-        dones=dones_arr
+class JassDNN(nn.Module):
+    """
+    Deep Neural Network for Jass policy prediction using one-hot encoded inputs.
+    """
+    def __init__(self, num_cards=71, trump_dim=7, hidden_sizes=[512, 256, 128]):
+        """
+        Initializes the JassDNN model.
+
+        Args:
+            num_cards (int): The number of possible card values (0-70).
+            trump_dim (int): The dimension of the one-hot encoded trump suit (7 suits).
+            hidden_sizes (list): A list of integers specifying the number of neurons
+                                 in each hidden layer.
+        """
+        super().__init__()
+        self.num_cards = num_cards
+        # Calculate the total input dimension: 71 card slots * num_cards + trump_dim
+        # Assuming state_idx[:, :71] contains 71 card indices.
+        total_input = 71 * num_cards + trump_dim
+
+        layers = []
+        in_dim = total_input
+        # Build the hidden layers with ReLU activation
+        for h in hidden_sizes:
+            layers.append(nn.Linear(in_dim, h))
+            layers.append(nn.ReLU())
+            in_dim = h
+
+        self.hidden = nn.Sequential(*layers)
+        # Policy head outputs logits for the 9 possible actions
+        self.policy_head = nn.Linear(in_dim, 9)
+
+    def forward(self, state_idx, trump_onehot, legal_mask=None):
+        """
+        Performs a forward pass through the network.
+
+        Args:
+            state_idx (torch.Tensor): Tensor of shape (batch_size, 71) containing
+                                      card indices.
+            trump_onehot (torch.Tensor): Tensor of shape (batch_size, 7) containing
+                                         one-hot encoded trump suit.
+            legal_mask (torch.Tensor, optional): Boolean mask of shape (batch_size, 9)
+                                                 indicating legal actions. Defaults to None.
+
+        Returns:
+            torch.Tensor: Log probabilities of the actions.
+        """
+        # One-hot encode the card indices
+        # Ensure indices are within bounds before one-hot encoding
+        card_indices_clamped = state_idx.clamp(0, self.num_cards - 1)
+        one_hot_cards = F.one_hot(card_indices_clamped, num_classes=self.num_cards).float()
+        # Flatten the one-hot encoded card representations
+        flat_cards = one_hot_cards.view(one_hot_cards.size(0), -1)
+
+        # Concatenate flattened cards and trump one-hot encoding
+        x = torch.cat([flat_cards, trump_onehot], dim=1)
+
+        # Pass through hidden layers
+        x = self.hidden(x)
+
+        # Get policy logits
+        logits = self.policy_head(x)
+
+        # Apply legal mask if provided
+        if legal_mask is not None:
+            logits = logits.masked_fill(~legal_mask, float('-inf'))
+
+        # Compute log softmax for policy probabilities
+        policy = F.log_softmax(logits, dim=1)
+        return policy
+
+def train(model, dataloader, optimizer, device):
+    """
+    Trains the model for one epoch with a progress bar.
+
+    Args:
+        model (nn.Module): The model to train.
+        dataloader (DataLoader): DataLoader for the training data.
+        optimizer (Optimizer): The optimizer to use.
+        device (torch.device): The device (cpu or cuda) to train on.
+
+    Returns:
+        float: The average training loss for the epoch.
+    """
+    model.train()
+    total_loss = 0
+    # Wrap the dataloader with tqdm for a progress bar
+    for state, action in tqdm(dataloader, desc="Training", leave=False):
+        state = state.to(device)
+        # Assuming state tensor structure is [71 card indices, 1 trump index]
+        card_idx = state[:, :71]
+        trump_idx = state[:, 71]
+        # Ensure trump index is within bounds [0, 6] for one-hot encoding
+        trump_idx_clamped = trump_idx.clamp(0, 6)
+        trump_onehot = F.one_hot(trump_idx_clamped, num_classes=7).float()
+
+        action = action.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass
+        log_policy = model(card_idx, trump_onehot)
+
+        # Ensure action tensor is 1D for NLL loss
+        if action.dim() != 1:
+            action = action.view(-1)
+
+        # Calculate loss
+        loss = F.nll_loss(log_policy, action)
+
+        # Backward pass and optimize
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(dataloader)
+
+def test(model, dataloader, device):
+    """
+    Evaluates the model on the test set with a progress bar.
+
+    Args:
+        model (nn.Module): The model to evaluate.
+        dataloader (DataLoader): DataLoader for the test data.
+        device (torch.device): The device (cpu or cuda) to evaluate on.
+
+    Returns:
+        float: The average test loss.
+    """
+    model.eval()
+    total_loss = 0
+    with torch.no_grad(): # Disable gradient calculation for evaluation
+        # Wrap the dataloader with tqdm for a progress bar
+        for state, action in tqdm(dataloader, desc="Testing", leave=False):
+            state = state.to(device)
+            # Assuming state tensor structure is [71 card indices, 1 trump index]
+            card_idx = state[:, :71]
+            trump_idx = state[:, 71]
+            # Ensure trump index is within bounds [0, 6] for one-hot encoding
+            trump_idx_clamped = trump_idx.clamp(0, 6)
+            trump_onehot = F.one_hot(trump_idx_clamped, num_classes=7).float()
+
+            action = action.to(device)
+
+            # Forward pass
+            log_policy = model(card_idx, trump_onehot)
+
+            # Ensure action tensor is 1D for NLL loss
+            if action.dim() != 1:
+                action = action.view(-1)
+
+            # Calculate loss
+            loss = F.nll_loss(log_policy, action)
+            total_loss += loss.item()
+
+    return total_loss / len(dataloader)
+
+
+if __name__ == '__main__':
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Train Jass DNN (Policy Only, One-Hot)')
+    parser.add_argument('--data', type=str, required=True, help='Path to jass_dataset.hdf5')
+    parser.add_argument('--epochs', type=int, default=10, help='Number of training epochs.')
+    parser.add_argument('--batch_size', type=int, default=256, help='Batch size for training and evaluation.')
+    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate for the optimizer.')
+    parser.add_argument('--num_samples', type=int, default=-1,
+                        help='Total number of samples to use from the dataset. Use -1 for all samples.')
+    parser.add_argument('--test_split', type=float, default=0.1,
+                        help='Fraction of data to use for the test set (e.g., 0.1 for 10%).')
+    parser.add_argument('--seed', type=int, default=MANUAL_SEED,
+                        help=f'Random seed for reproducibility (default: {MANUAL_SEED}).')
+    parser.add_argument('--save_dir', type=str, default='models',
+                        help='Directory to save model checkpoints.')
+    parser.add_argument('--metrics_csv', type=str, default='training_metrics.csv',
+                        help='Path to save the training metrics CSV file.') # New argument
+    args = parser.parse_args()
+
+    # Set the random seed for reproducibility
+    set_seed(args.seed)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # Create save directory if it doesn't exist
+    os.makedirs(args.save_dir, exist_ok=True)
+    best_model_path = os.path.join(args.save_dir, 'best_jass_dnn_policy.pth')
+
+    # Load the full dataset
+    full_dataset = JassDataset(args.data)
+
+    # Determine the total number of samples to use
+    if args.num_samples > 0 and args.num_samples <= len(full_dataset):
+        total_samples_to_use = args.num_samples
+        # Create a subset of the full dataset if num_samples is specified
+        indices = list(range(len(full_dataset)))
+        random.shuffle(indices) # Shuffle indices before taking a subset
+        subset_indices = indices[:total_samples_to_use]
+        dataset_to_split = Subset(full_dataset, subset_indices)
+        print(f'Using a subset of {total_samples_to_use} samples from the dataset.')
+    else:
+        total_samples_to_use = len(full_dataset)
+        dataset_to_split = full_dataset
+        print(f'Using all {total_samples_to_use} samples from the dataset.')
+
+
+    # Split the dataset into training and test sets
+    test_size = int(total_samples_to_use * args.test_split)
+    train_size = total_samples_to_use - test_size
+    # random_split uses the PyTorch random seed, which is set by set_seed()
+    train_dataset, test_dataset = torch.utils.data.random_split(
+        dataset_to_split, [train_size, test_size]
     )
 
-# --- Data Splitter ---
-def split_groups(hdf5_path, test_fraction=0.2, rng=None):
-    rng = rng or np.random.default_rng()
-    with h5py.File(hdf5_path, 'r') as f:
-        all_groups = list(f.keys())
-        total_states = f.attrs.get('total_states_saved', sum(len(f[g]['state']) for g in all_groups))
-    target_test = total_states * test_fraction
-    rng.shuffle(all_groups)
-    test_g, train_g, count = [], [], 0
-    with h5py.File(hdf5_path, 'r') as f:
-        for g in all_groups:
-            n = f[g].attrs.get('total_states_saved', len(f[g]['state']))
-            (test_g if count < target_test else train_g).append(g)
-            count += n
-    return train_g, test_g
+    print(f'Splitting data into {len(train_dataset)} training samples and {len(test_dataset)} test samples.')
 
-# --- Main Function ---
-def main():
-    os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
-    hdf5_path = '../log_parser/jass_dataset.hdf5'
-    log_dir = './logs_bc/'
-    rng_seed = 42
+    # Create DataLoaders for training and test sets
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
+    test_loader = DataLoader(test_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0) # No need to shuffle test data
 
-    np.random.seed(rng_seed)
-    torch.manual_seed(rng_seed)
-    rng = np.random.default_rng(rng_seed)
+    # Initialize the model, optimizer, and move model to device
+    model = JassDNN().to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr)
 
-    os.makedirs(log_dir, exist_ok=True)
-    logger = imit_logger.configure(folder=log_dir, format_strs=["stdout", "log", "csv", "tensorboard"])
+    # Variable to track the best test loss and save the corresponding model
+    best_test_loss = float('inf')
 
-    print("Splitting data...")
-    train_groups, test_groups = split_groups(hdf5_path, 0.2, rng)
-    print(f"Train episodes: {len(train_groups)}, Test episodes: {len(test_groups)}")
+    print(f'Starting training for {args.epochs} epochs...')
 
-    print("Loading transitions...")
-    train_trans = load_transitions(hdf5_path, train_groups)
-    test_trans = load_transitions(hdf5_path, test_groups)
+    # Open the CSV file for writing metrics
+    with open(args.metrics_csv, 'w', newline='') as csvfile:
+        metric_writer = csv.writer(csvfile)
+        # Write the header row
+        metric_writer.writerow(['Epoch', 'Train Loss', 'Test Loss'])
 
-    print("Setting up evaluation env...")
-    num_envs = 8
-    def make_env(): return Monitor(JassEnv(hdf5_path, test_groups, rng), log_dir)
-    eval_env = DummyVecEnv([make_env for _ in range(num_envs)])
+        for epoch in range(1, args.epochs + 1):
+            print(f'Epoch {epoch}/{args.epochs}') # Print current epoch number
 
-    try:
-        check_env(JassEnv(hdf5_path, test_groups, rng))
-        print("Environment check passed.")
-    except Exception as e:
-        print(f"Env check failed: {e}")
+            # Train for one epoch with progress bar
+            train_loss = train(model, train_loader, optimizer, device)
 
-    policy_kwargs = dict(
-        features_extractor_class=JassFeatureExtractor,
-        features_extractor_kwargs={'embedding_dim': 16},
-        net_arch=dict(pi=[64, 64], vf=[64, 64])
-    )
-    policy = ActorCriticPolicy(
-        observation_space=eval_env.observation_space,
-        action_space=eval_env.action_space,
-        lr_schedule=lambda _: 3e-4,
-        **policy_kwargs
-    )
+            # Evaluate on the test set with progress bar
+            test_loss = test(model, test_loader, device)
 
-    bc_trainer = BC(
+            # Print epoch results
+            print(f'Epoch {epoch}/{args.epochs}: Train Loss = {train_loss:.4f}, Test Loss = {test_loss:.4f}')
 
-        observation_space=eval_env.observation_space,
-        action_space=eval_env.action_space,
-        rng=rng,
-        policy=policy,
-        demonstrations=train_trans,
-        device='auto',
-        custom_logger=logger,
-    )
+            # Write metrics to the CSV file
+            metric_writer.writerow([epoch, train_loss, test_loss])
+            # Flush the buffer to ensure data is written to the file immediately
+            csvfile.flush()
 
-    print("Training BC policy...")
-    bc_trainer.train(n_batches=10000)
 
-    print("Evaluating policy...")
-    returns = rollout.generate_trajectories(bc_trainer.policy, eval_env, rollout.make_sample_until(min_episodes=10), rng)
-    mean_ret = np.mean([ep.rews.sum() for ep in returns])
-    print(f"Mean return over 20 episodes: {mean_ret:.3f}")
+            # Check if the current test loss is the best seen so far
+            if test_loss < best_test_loss:
+                best_test_loss = test_loss
+                # Save the model state dictionary
+                torch.save(model.state_dict(), best_model_path)
+                print(f'Saved best model with Test Loss: {best_test_loss:.4f}')
 
-    policy_path = os.path.join(log_dir, "bc_policy.zip")
-    bc_trainer.policy.save(policy_path)
-    print(f"Policy saved to {policy_path}")
+    print('Training finished.')
 
-    eval_env.close()
-    print("Completed.")
-
-if __name__ == "__main__":
-    main()
+    # Close the HDF5 file when done
+    full_dataset.close()

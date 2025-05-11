@@ -4,7 +4,6 @@ import h5py
 import re
 import logging
 import os
-import json
 from typing import List, Dict, Any, Optional, Tuple
 
 NUM_CARDS_HAND = 9
@@ -17,7 +16,7 @@ NUM_STATE = NUM_CARDS_HAND + NUM_CARDS_TABLE + NUM_CARDS_HISTORY + NUM_CARDS_SHO
 
 # --- Logging Configuration ---
 logging.basicConfig(level=logging.INFO,
-                    format='%(asctime)s - %(levelname)s - %(thread)d - %(message)s',
+                    format='%(asctime)s - %(levelname)s - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     handlers=[
                         logging.FileHandler("jass_log_parser.log"), # Log to a file
@@ -52,6 +51,11 @@ def create_state(hand: List[int], table: List[int], history: List[int], shown: L
     state += history + [0] * (NUM_CARDS_HISTORY - len(history)) # Fill with zeros if history is shorter than expected
     state += table + [0] * (NUM_CARDS_TABLE - len(table)) # Fill with zeros if table is shorter than expected
     state += hand + [0] * (NUM_CARDS_HAND - len(hand)) # Fill with zeros if hand is shorter than expected
+
+    if len(shown) != 3:
+        logging.error(f"Shown cards length mismatch: expected 3, got {len(shown)}")
+        raise ValueError(f"Shown cards length mismatch: expected 3, got {len(shown)}")
+
     for shown_cards in shown:
         state += shown_cards + [0] * (9 - len(shown_cards))
     state += [trump] # Add trump value
@@ -76,7 +80,7 @@ def create_action(card: int, hand: list[int]) -> int:
 
 
 # --- Parser Functions ---
-def parse_file(file_path: str, hdf5_file: h5py.File) -> int:
+def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5_time: h5py.File) -> int:
     """
     Parse the Jass log file and store the data in an HDF5 file.
 
@@ -88,22 +92,26 @@ def parse_file(file_path: str, hdf5_file: h5py.File) -> int:
     file_name = os.path.basename(file_path)
     game_group_name = os.path.splitext(file_name)[0] 
 
-    player_infos: List[Dict[str, Any]] = []
     player_ids_in_game: List[str] = []
     found_all_players = False # Flag to track if player info is complete for this game
 
-    if game_group_name in hdf5_file:
-        logging.warning(f"Group '{game_group_name}' already exists in HDF5 file. Overwriting.")
-        del hdf5_file[game_group_name]
-    group = hdf5_file.create_group(game_group_name)
+
+    group_play = hdf5_play.create_group(game_group_name)
+    group_trump = hdf5_trump.create_group(game_group_name)
+    group_time = hdf5_time.create_group(game_group_name)
     logging.debug(f"Created HDF5 group: /{game_group_name}")
 
+    dset_state_play = group_play.create_dataset("state", (0, NUM_STATE), maxshape=(None, NUM_STATE), chunks=(1,NUM_STATE), dtype='uint8', compression="gzip")
+    dset_state_trump = group_trump.create_dataset("state", (0, 10), maxshape=(None, 10), chunks=True, dtype='uint8', compression="gzip")
+    dset_state_time = group_time.create_dataset("state", (0, NUM_STATE), maxshape=(None, NUM_STATE), chunks=(1,NUM_STATE), dtype='uint8', compression="gzip")
 
-    dset_state = group.create_dataset("state", (0, NUM_STATE), maxshape=(None, NUM_STATE), chunks=True, dtype='uint8', compression="gzip")
-    dset_player_info = group.create_dataset("player_id", (0,1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
+    dset_player_info_play = group_play.create_dataset("player_info", (0, 1), maxshape=(None, 1), chunks=True, dtype=h5py.string_dtype(length=32), compression="gzip")
+    dset_player_info_trump = group_trump.create_dataset("player_info", (0, 1), maxshape=(None, 1), chunks=True, dtype=h5py.string_dtype(length=32), compression="gzip")
+    dset_player_info_time = group_time.create_dataset("player_info", (0, 1), maxshape=(None, 1), chunks=True, dtype=h5py.string_dtype(length=32), compression="gzip")
 
-    dset_action = group.create_dataset("action", (0,1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
-    dest_time = group.create_dataset("time", (0,1), maxshape=(None, 1), chunks=True, dtype='float', compression="gzip")
+    dset_action_play = group_play.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
+    dset_action_trump = group_trump.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
+    dset_action_time = group_time.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='float', compression="gzip")
 
     time_last_action: Optional[datetime] = None
     player_order: Dict[str, int] = {} # Maps player IDs to their order in the game
@@ -116,10 +124,13 @@ def parse_file(file_path: str, hdf5_file: h5py.File) -> int:
     trick_counter: int = 0 # Counts cards played in the current trick (0-3)
     round_card_counter: int = 0 # Counts total cards played in the round (0-35)
     trump: int = 0 # Current trump suit
+    trump_pushed: bool = False # Flag to track if trump has been set
 
     logging.debug(f"Processing file: {filename}")
     line_count = 0
-    saved_states = 0
+    saved_states_play = 0
+    saved_states_trump = 0
+    saved_states_time = 0
 
     discarded = False
 
@@ -135,21 +146,11 @@ def parse_file(file_path: str, hdf5_file: h5py.File) -> int:
                 # Match Player Info (New Game)
                 m_player = r_playerInfo.search(line)
                 if m_player and not found_all_players:
-                    p_info = {
-                        "usernickname": m_player.group(1),
-                        "eq": int(m_player.group(2)), "iq": int(m_player.group(3)),
-                        "niceness": int(m_player.group(4)), "honness": int(m_player.group(5)),
-                        "winness": int(m_player.group(6)), "playedgames": int(m_player.group(7)),
-                        "profival": int(m_player.group(8))
-                    }
+                    player_ids_in_game.append(m_player.group(1))
+                    logging.debug(f"Found player {m_player.group(1)}")
 
-                    player_infos.append(p_info)
-                    player_ids_in_game.append(p_info["usernickname"])
-                    logging.debug(f"Found player {p_info['usernickname']}")
-
-                    if len(player_infos) == 4:
+                    if len(player_ids_in_game) == 4:
                         # Save player info once 4 players are found
-                        group.attrs["players"] = json.dumps(player_infos)
                         logging.debug(f"Found 4 players for game {game_group_name}: {player_ids_in_game}")
                         found_all_players = True # Stop looking for player info
                         # Initialize hands structure now that we know the players
@@ -182,6 +183,7 @@ def parse_file(file_path: str, hdf5_file: h5py.File) -> int:
                     trump = 0
                     player_order = {}
                     shown = [[] for _ in range(4)]
+                    trump_pushed = False # Reset trump pushed flag
                     continue
 
                 # Match Cards Dealt
@@ -237,12 +239,41 @@ def parse_file(file_path: str, hdf5_file: h5py.File) -> int:
                         player_id = m_trump.group(2)
                         trump_val = int(m_trump.group(3)) + 1
 
+                        if player_id not in hands:
+                            logging.warning(f"Line {line_count}: Player {player_id} set trump but no hand structure found (maybe missed player info?). Skipping.")
+                            discarded = True
+                            break
+
                         if player_id not in player_ids_in_game:
-                             logging.warning(f"Line {line_count}: Player {player_id} set trump but not in known players {player_ids_in_game}. Trump setting ignored.")
-                             continue
+                            logging.warning(f"Line {line_count}: Player {player_id} set trump but not in known players {player_ids_in_game}. Trump setting ignored.")
+                            discarded = True
+                            break
+
+                        current_size_trump = dset_state_trump.shape[0]
+                        dset_state_trump.resize(current_size_trump + 1, axis=0)
+                        dset_player_info_trump.resize(current_size_trump + 1, axis=0)
+                        dset_action_trump.resize(current_size_trump + 1, axis=0)
+
+                        current_size_time = dset_state_time.shape[0]
+                        dset_state_time.resize(current_size_time + 1, axis=0)
+                        dset_player_info_time.resize(current_size_time + 1, axis=0)
+                        dset_action_time.resize(current_size_time + 1, axis=0)
+
+                        dset_state_trump[current_size_trump:] = hands[player_id] + [int(trump_pushed)]
+                        dset_player_info_trump[current_size_trump] = player_id
+                        dset_action_trump[current_size_trump:] = [trump_val]
+                        saved_states_trump += 1
+
+                        state_time = create_state(hands[player_id], [], [], [[],[],[]], 0) # 0 to indicate time is for trumping
+                        dset_state_time[current_size_time:] = state_time
+                        dset_player_info_time[current_size_time] = player_id
+                        dset_action_time[current_size_time] = (trump_time - time_last_action).total_seconds()
+                        saved_states_time += 1
 
                         logging.debug(f"Player {player_id} sets trump to {trump_val}")
                         trump = trump_val
+                        if trump == 0:
+                            trump_pushed = True
 
                         if time_last_action is None or trump_time > time_last_action:
                              time_last_action = trump_time
@@ -306,19 +337,27 @@ def parse_file(file_path: str, hdf5_file: h5py.File) -> int:
                         # --- Save State and Action to HDF5 ---
 
                         # Resize datasets before appending
-                        current_size = dset_state.shape[0]
-                        dset_state.resize(current_size + 1, axis=0)
-                        dset_player_info.resize(current_size + 1, axis=0)
-                        dset_action.resize(current_size + 1, axis=0)
-                        dest_time.resize(current_size + 1, axis=0)
+                        current_size_play = dset_state_play.shape[0]
+                        dset_state_play.resize(current_size_play + 1, axis=0)
+                        dset_player_info_play.resize(current_size_play + 1, axis=0)
+                        dset_action_play.resize(current_size_play + 1, axis=0)
+
+                        current_size_time = dset_state_time.shape[0]
+                        dset_state_time.resize(current_size_time + 1, axis=0)
+                        dset_player_info_time.resize(current_size_time + 1, axis=0)
+                        dset_action_time.resize(current_size_time + 1, axis=0)
+                        dset_state_time[current_size_time:] = state
 
                         # Append data to the last row
-                        dset_state[current_size:] = state
-                        dset_player_info[current_size] = list(hands.keys()).index(player_id)
-                        dset_action[current_size:] = action
-                        dest_time[current_size] = time_delta_seconds
+                        dset_state_play[current_size_play:] = state
+                        dset_player_info_play[current_size_play] = player_id
+                        dset_action_play[current_size_play:] = action
+                        saved_states_play += 1
 
-                        saved_states += 1
+                        dset_state_time[current_size_time:] = state
+                        dset_player_info_time[current_size_time] = player_id
+                        dset_action_time[current_size_time] = time_delta_seconds
+                        saved_states_time += 1
 
                         # --- Update Game State AFTER saving ---
                         card_found_in_hand = False
@@ -376,29 +415,34 @@ def parse_file(file_path: str, hdf5_file: h5py.File) -> int:
         discarded = True
 
     # Add final attributes after processing the file
-    group.attrs['total_states_saved'] = saved_states
-    group.attrs['log_lines_processed'] = line_count
-    if not found_all_players and saved_states > 0:
-         logging.warning(f"Finished processing {filename}, but player info might be incomplete. Saved {saved_states} states.")
-    elif saved_states > 0:
-         logging.debug(f"Finished processing {filename}. Saved {saved_states} state-action pairs to group /{game_group_name}.")
+    group_play.attrs['total_states_saved'] = saved_states_play
+    group_trump.attrs['total_states_saved'] = saved_states_trump
+    group_time.attrs['total_states_saved'] = saved_states_time
+    if not found_all_players and saved_states_play > 0:
+         logging.warning(f"Finished processing {filename}, but player info might be incomplete. Saved {saved_states_play},{saved_states_time},{saved_states_trump} states.")
+    elif saved_states_play > 0:
+         logging.debug(f"Finished processing {filename}. Saved {saved_states_play},{saved_states_time},{saved_states_trump} state-action pairs to group /{game_group_name}.")
     else:
          logging.warning(f"Finished processing {filename}. No state-action pairs saved (possibly due to missing info or errors).")
 
     if discarded:
         logging.warning(f"Discarded file {filename} due to critical errors. No data saved.")
-        del hdf5_file[game_group_name] # Remove the group from HDF5 file
-        return 0 # Skip this file
+        del hdf5_play[game_group_name] # Remove the group from HDF5 file
+        del hdf5_trump[game_group_name]
+        del hdf5_time[game_group_name]
+        return (0, 0, 0) # Return zero states saved
     
-    hdf5_file.flush() # Ensure changes are written to disk
-    return saved_states # Return the number of states saved for this file
+    hdf5_play.flush()
+    hdf5_trump.flush()
+    hdf5_time.flush()
+    return (saved_states_play, saved_states_trump, saved_states_time)
 
 
 # --- Main Execution ---
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Parse Jass game log files and save state-action pairs to HDF5.")
     parser.add_argument("-i","--input-dir", required=True, help="Directory containing the .game log files.")
-    parser.add_argument("-o","--output-file", required=True, help="Path to the output HDF5 file.")
+    parser.add_argument("-o","--output-dir", required=True, help="Path to the output directory.")
     parser.add_argument("-n","--num-files", type=int, default=0, help="Number of files to process (0 for all).")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose output.")
     args = parser.parse_args()
@@ -408,25 +452,36 @@ if __name__ == "__main__":
         logging.getLogger().setLevel(logging.DEBUG)
         logging.debug("Verbose mode enabled. Detailed logs will be shown.")
 
+    play_file = os.path.join(args.output_dir, "playing.hdf5")
+    trump_file = os.path.join(args.output_dir, "trump.hdf5")
+    time_file = os.path.join(args.output_dir, "time.hdf5")
+
     try:
-        with h5py.File(args.output_file, 'a') as hdf5_file:
+        with h5py.File(play_file, 'a') as hdf5_playing, h5py.File(trump_file, 'a') as hdf5_trump, h5py.File(time_file, 'a') as hdf5_time:
             input_files = [f for f in os.listdir(args.input_dir) if f.endswith('.game')]
-            num_states = 0
+            num_states_played = 0
+            num_states_trump = 0
+            num_states_time = 0
             if args.num_files > 0:
                 input_files = input_files[:args.num_files]
             counter = 0
             for filename in input_files:
                 file_path = os.path.join(args.input_dir, filename)
-                num_states += parse_file(file_path, hdf5_file)
+                states_played, states_trump, states_time = parse_file(file_path, hdf5_playing, hdf5_trump, hdf5_time)
+                num_states_played += states_played
+                num_states_trump += states_trump
+                num_states_time += states_time
                 counter += 1
                 if counter % 100 == 0:
-                    logging.info(f"Processed {counter} files of {len(input_files)}. Total states saved so far: {num_states}")
+                    logging.info(f"Processed {counter} files of {len(input_files)}. Total states saved so far: {num_states_played}, {num_states_trump}, {num_states_time}.")
 
-            logging.info(f"Total states saved: {num_states}")
+            logging.info(f"Total states saved: {num_states_played}")
 
-            hdf5_file.attrs['total_states_saved'] = num_states
+            hdf5_playing.attrs['total_states_saved'] = num_states_played
+            hdf5_trump.attrs['total_states_saved'] = num_states_trump
+            hdf5_time.attrs['total_states_saved'] = num_states_time
     
     except Exception as e:
         # Catch errors related to opening/writing the HDF5 file itself
-        logging.critical(f"Failed to open or write to HDF5 file {args.output_file}: {e}")
+        logging.critical(f"Failed to open or write to HDF5 file {args.output_dir}: {e}")
         logging.exception("Traceback:")

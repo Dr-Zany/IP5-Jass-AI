@@ -9,7 +9,7 @@ RANKS = ['6', '7', '8', '9', '10', 'J', 'Q', 'K', 'A']
 SUITS = ['Diamonds', 'Clubs', 'Hearts', 'Spades']
 # Trump unicode symbols
 TRUMP = ['♦', '♣', '♥', '♠', '↓', '↑']  # ♦ ♣ ♥ ♠ ↓ ↑
-TRUMP_NAMES = ['Diamonds', 'Clubs', 'Hearts', 'Spades', 'Bottom-up', 'Top-down']
+TRUMP_NAMES = ['Diamonds', 'Clubs', 'Hearts', 'Spades', 'Top-down','Bottom-up']
 
 # Build deck list: 36 cards
 DECK = [f"{rank} of {suit}" for suit in SUITS for rank in RANKS]

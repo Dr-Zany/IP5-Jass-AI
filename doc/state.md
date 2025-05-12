@@ -55,7 +55,7 @@ By using a embedding of 36 dimensions for each card, we can represent the cards 
 |  [ C1 ][ C2 ][ … ][ C9 ] × 3 players    |               |
 +---------------------------------------------------------+
 |  Trump Suit 1                           | Value 1 -> 6  |
-|  [ ↓  ↑  ♠  ♥  ♣  ♦ ]                   |               |
+|  [ ↑  ↓  ♣  ♠  ♥  ♦ ]                   |               |
 +---------------------------------------------------------+
 
 ```
@@ -91,16 +91,16 @@ So, the complete input state is a 2527-dimensional vector.
 - **6-Bit Vectore Trump:**
    Trump is endcode with 6 dimensions, where each dimension corresponds to a specific trump suit. The encoding is as follows:
    ```
-   +------------------+    
-   | 6:  Top-down  ↓  |
    +------------------+
-   | 5:  Bottom-up ↑  |
+   | 6:  Bottom-up ↑  |
    +------------------+
-   | 4:  Spades    ♠  |
+   | 5:  Top-down  ↓  |
    +------------------+
-   | 3:  Hearts    ♥  |
+   | 4:  Clubs     ♣  |
    +------------------+
-   | 2:  Clubs     ♣  |
+   | 3:  Spades    ♠  |
+   +------------------+
+   | 2:  Hearts    ♥  |
    +------------------+
    | 1:  Diamonds  ♦  |
    +------------------+

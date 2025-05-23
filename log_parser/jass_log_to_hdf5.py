@@ -147,7 +147,13 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                 m_player = r_playerInfo.search(line)
                 if m_player and not found_all_players:
                     player_ids_in_game.append(m_player.group(1))
+                    niceness = int(m_player.group(4))
                     logging.debug(f"Found player {m_player.group(1)}")
+
+                    if niceness <= 0:
+                        logging.warning(f"Line {line_count}: Player {m_player.group(1)} is not nice. skipping this game.")
+                        discarded = True
+                        break
 
                     if len(player_ids_in_game) == 4:
                         # Save player info once 4 players are found
@@ -246,6 +252,11 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
 
                         if player_id not in player_ids_in_game:
                             logging.warning(f"Line {line_count}: Player {player_id} set trump but not in known players {player_ids_in_game}. Trump setting ignored.")
+                            discarded = True
+                            break
+
+                        if trump_pushed and not trump_val in range(1, 7):
+                            logging.warning(f"Line {line_count}: Player {player_id} set trump to {trump_val} but trump has already been pushed. Ignoring.")
                             discarded = True
                             break
 

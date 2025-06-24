@@ -36,7 +36,7 @@ The decision has been taken to exclude the score, on the basis that it is consid
 
 That would give us a input dimension of: 
 1152 (History) + 108 (Current Played) + 324 (Hand) + 973 (other hands) + 6 (Trump) = **2527**
-By using a embedding of 36 dimensions for each card, we can represent the cards as indexs form.
+By using a embedding of 13 dimensions for each card, we can represent the cards as indexs form and make the complet input state to **936** dimesions.
 
 ```
 +---------------------------------------------------------+
@@ -60,8 +60,7 @@ By using a embedding of 36 dimensions for each card, we can represent the cards 
 
 ```
 The input state can be represented as 72 indices, where each index corresponds to a specific card or trump suit.
-
-So, the complete input state is a 2527-dimensional vector.
+So, the complete input state is a 936-dimensional after the embedding.
 
 ### Encoding Details
 

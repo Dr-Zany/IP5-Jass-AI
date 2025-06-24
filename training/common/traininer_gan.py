@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from training_monitor import TrainingMonitor
+from .training_monitor import TrainingMonitor
 
 class TrainerGan:
     def __init__(self, loss_fn, accuracy_fn, train_loader: DataLoader, val_loader: DataLoader, model_path: str, device='cpu'):
@@ -44,12 +44,10 @@ class TrainerGan:
             fake_labels = torch.zeros(batch_size, device=self.device)
 
             disc_optimizer.zero_grad()
-            real_output = discriminator(state, action).squeeze()
-            fake_output = discriminator(state, fake_action).squeeze()
+            real_score = discriminator(state, action).squeeze()
+            fake_score = discriminator(state, fake_action).squeeze()
 
-            real_loss = self.loss_fn(real_output, real_labels)
-            fake_loss = self.loss_fn(fake_output, fake_labels)
-            disc_loss = real_loss + fake_loss
+            disc_loss = self.loss_fn(real_score) - self.loss_fn(fake_score)
             disc_loss.backward()
             disc_optimizer.step()
 
@@ -58,7 +56,7 @@ class TrainerGan:
             fake_action = torch.argmax(gumbel_softmax, dim=1, keepdim=True)
             gen_optimizer.zero_grad()
             fake_output = discriminator(state, fake_action).squeeze()
-            gen_loss = self.loss_fn(fake_output, real_labels)
+            gen_loss = self.loss_fn(fake_output)
             gen_loss.backward()
             gen_optimizer.step()
 

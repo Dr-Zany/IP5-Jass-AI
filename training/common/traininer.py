@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.data import DataLoader
-from training_monitor import TrainingMonitor
+from .training_monitor import TrainingMonitor
 
 class Trainer:
     def __init__(self, loss_fn, accuracy_fn, train_loader: DataLoader, val_loader: DataLoader, model_path, device='cpu'):

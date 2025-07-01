@@ -3,28 +3,47 @@ import torch.nn as nn
 from tqdm import tqdm
 from torch.utils.data import DataLoader
 from .training_monitor import TrainingMonitor
+from .model_dnn import ModelDNN
+from signal import signal, getsignal, SIGINT, SIGTERM
+
 
 class Trainer:
-    def __init__(self, loss_fn, accuracy_fn, train_loader: DataLoader, val_loader: DataLoader, model_path, device='cpu'):
+    def __init__(self, loss_fn, accuracy_fn, train_loader: DataLoader, val_loader: DataLoader, model_path: str, device='cpu'):
         self.model_path = model_path
         self.loss_fn = loss_fn
         self.accuracy_fn = accuracy_fn
         self.train_loader = train_loader
         self.val_loader = val_loader
         self.device = device
+        self.original_sigint_handler = getsignal(SIGINT)
+        self.stop_training = False
         self.monitor = TrainingMonitor()
 
-    def train(self, epochs, model, model_name="default", optimizer=None):
-        self.monitor.set_model_name(model_name)
+    def _signal_handler(self, signum, frame):
+        print(f"Received signal {signum}, stopping training...")
+        signal(SIGINT, self.original_sigint_handler)
+        self.stop_training = True
+
+    def train(self, epochs: int, model: ModelDNN, optimizer=None):
+        signal(SIGINT, self._signal_handler)
+        self.monitor.set_model_name(model.name)
+        print(f"Training model: {model.name}")
         for epoch in range(epochs):
             train_loss, train_accuracy = self._train_epoch(epoch, model, optimizer)
             val_loss, val_accuracy = self._validate_epoch(epoch, model)
             print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
-            if val_loss < min(self.monitor.val_losses[model_name][:-1], default=float('inf')):
-                torch.save(model.state_dict(), self.model_path + f"/{model_name}.pth")
+            
+            if val_loss < min(self.monitor.val_losses[model.name][:-1], default=float('inf')):
+                torch.save(model.state_dict(), self.model_path + f"/{model.name}.pth")
                 print(f"Model saved at epoch {epoch+1} with validation loss {val_loss:.4f}")
             else:
                 break
+
+            if self.stop_training:
+                print("Early stopping triggered.")
+                break
+        # Restore the original signal handler
+        signal(SIGINT, self.original_sigint_handler)
             
     def _train_epoch(self, epoch, model, optimizer):
         model.train()
@@ -35,14 +54,14 @@ class Trainer:
             state, action = state.to(self.device), action.to(self.device)
 
             optimizer.zero_grad()
-            output = model(state)
+            logits = model(state)
             action = action.view(-1)
-            loss = self.loss_fn(output, action)
+            loss = self.loss_fn(logits, action)
             loss.backward()
             optimizer.step()
 
             total_loss += loss.item()
-            batch_acc = self.accuracy_fn(output, action)
+            batch_acc = self.accuracy_fn(logits, action)
             total_acc += batch_acc.item()
             self.monitor.on_train_batch_end(logs={'loss': loss.item(), 'accuracy': batch_acc.item()})
         

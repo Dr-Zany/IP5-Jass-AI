@@ -25,9 +25,9 @@ class TrainerGan:
         signal(SIGINT, self.original_sigint_handler)
         self.stop_training = True
 
-    def _gradient_penalty(self, discriminator, state, real_action_oh, fake_action_oh):
+    def _gradient_penalty(self, critic, state, real_action_oh, fake_action_oh):
         # Real input
-        embedded_state = discriminator.forward_embedded(state)  # shape: [B, state_embed_dim]
+        embedded_state = critic.forward_embedded(state)  # shape: [B, state_embed_dim]
         real_input = torch.cat((embedded_state, real_action_oh), dim=1)  # shape: [B, state_embed_dim + 9]
         fake_input = torch.cat((embedded_state, fake_action_oh), dim=1)  # shape: [B, state_embed_dim + 9]
 
@@ -37,7 +37,7 @@ class TrainerGan:
         interpolated = (alpha * real_input + (1 - alpha) * fake_input)
         interpolated.requires_grad_(True)
 
-        d_interpolates = discriminator.forward_layers(interpolated).squeeze(-1)  # shape: [B]
+        d_interpolates = critic.forward_layers(interpolated).squeeze(-1)  # shape: [B]
 
         gradients = torch.autograd.grad(
             outputs=d_interpolates.sum(),
@@ -51,14 +51,12 @@ class TrainerGan:
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()  # scalar
         return gradient_penalty
 
-    def train(self, epochs: int, generator: ModelDNN, discriminator: ModelDNN, gen_optimizer, disc_optimizer):
+    def train(self, epochs: int, critic: ModelDNN, discriminator: ModelDNN, gen_optimizer, disc_optimizer):
         signal(SIGINT, self._signal_handler)
-        self.monitor.set_model_name(generator.name)
-        self.monitor.set_model_name(discriminator.name)
 
         for epoch in range(epochs):
-            gen_train_loss, disc_train_loss = self._train_epoch(epoch, generator, discriminator, gen_optimizer, disc_optimizer)
-            gen_val_loss, disc_val_loss = self._validate_epoch(epoch, generator, discriminator)
+            gen_train_loss, disc_train_loss = self._train_epoch(epoch, critic, discriminator, gen_optimizer, disc_optimizer)
+            gen_val_loss, disc_val_loss = self._validate_epoch(epoch, critic, discriminator)
             print(f"Epoch {epoch+1}/{epochs} - Generator Train Loss: {gen_train_loss:.4f}, Discriminator Train Loss: {disc_train_loss:.4f}, Generator Val Loss: {gen_val_loss:.4f}, Discriminator Val Loss: {disc_val_loss:.4f}")
 
             if self.stop_training:
@@ -67,13 +65,18 @@ class TrainerGan:
 
         signal(SIGINT, self.original_sigint_handler)
 
-    def _train_epoch(self, epoch, generator, discriminator, gen_optimizer, disc_optimizer):
+    def _topk_entropy(self, logits, k=3):
+        # logits: [B, num_classes]
+        probs = F.softmax(logits, dim=-1)             # Convert to probabilities
+        topk_probs, _ = torch.topk(probs, k=k, dim=-1) # [B, k]
+        entropy = - (topk_probs * torch.log(topk_probs + 1e-12)).sum(dim=-1)  # [B]
+        return entropy.mean().item()
+
+    def _train_epoch(self, epoch, generator, critic, gen_optimizer, disc_optimizer):
         generator.train()
-        discriminator.train()
+        critic.train()
         total_gen_loss = 0.0
         total_disc_loss = 0.0
-        total_gen_acc = 0.0
-        total_disc_acc = 0.0
 
         gen_step = 0
         disc_step = 0
@@ -90,15 +93,11 @@ class TrainerGan:
 
             # Discriminator update
             disc_optimizer.zero_grad()
-            real_score = discriminator(state, real_action_oh).squeeze()
-            fake_score = discriminator(state, fake_action_oh).squeeze()
+            real_score = critic(state, real_action_oh).squeeze()
+            fake_score = critic(state, fake_action_oh).squeeze()
 
-            gp = self._gradient_penalty(discriminator, state, real_action_oh, fake_action_oh)
+            gp = self._gradient_penalty(critic, state, real_action_oh, fake_action_oh)
             disc_loss = -torch.mean(real_score) + torch.mean(fake_score) + self.lambda_gp * gp
-
-            real_pred = (real_score > 0).float()
-            fake_pred = (fake_score < 0).float()
-            disc_acc = 0.5 * (real_pred.mean().item() + fake_pred.mean().item())
 
             if prev_disc_loss is not None:
                 r_d = abs(disc_loss.item() - prev_disc_loss) / max(abs(prev_disc_loss), 1e-8)
@@ -110,12 +109,8 @@ class TrainerGan:
             gen_optimizer.zero_grad()
             logits = generator(state)
             fake_action_oh = F.gumbel_softmax(logits, tau=1.0, hard=True)
-            fake_output = discriminator(state, fake_action_oh).squeeze()
+            fake_output = critic(state, fake_action_oh).squeeze()
             gen_loss = -torch.mean(fake_output)
-
-            # Add behavioral cloning loss as hint
-            # bc_loss = F.cross_entropy(logits, action.squeeze(dim=1))
-            # gen_loss += 0.2 * bc_loss
 
             if prev_gen_loss is not None:
                 r_g = abs(gen_loss.item() - prev_gen_loss) / max(abs(prev_gen_loss), 1e-8)
@@ -127,7 +122,7 @@ class TrainerGan:
             if self.balance_lambda * r_g < r_d:
                 disc_step += 1
                 disc_loss.backward()
-                torch.nn.utils.clip_grad_norm_(discriminator.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
                 disc_optimizer.step()
             else:
                 gen_step += 1
@@ -135,22 +130,27 @@ class TrainerGan:
                 torch.nn.utils.clip_grad_norm_(generator.parameters(), max_norm=1.0)
                 gen_optimizer.step()
 
-            gen_acc = logits.argmax(dim=1).eq(action).float().mean().item()
-
             total_disc_loss += disc_loss.item()
-            total_disc_acc += disc_acc
             total_gen_loss += gen_loss.item()
-            total_gen_acc += gen_acc
+            entropy_k3 = self._topk_entropy(logits, k=3)
 
-            self.monitor.on_train_batch_end(logs={'loss': gen_loss.item(), 'accuracy': gen_acc}, model_name=generator.name)
-            self.monitor.on_train_batch_end(logs={'loss': disc_loss.item(), 'accuracy': disc_acc}, model_name=discriminator.name)
+
+            self.monitor.on_train_batch_end(model_name=generator.name, key='loss', value=gen_loss.item(), unit="loss")
+            self.monitor.on_train_batch_end(model_name=critic.name, key='loss', value=disc_loss.item(), unit="loss")
+            self.monitor.on_train_batch_end(model_name=generator.name, key='score', value=fake_score.mean().item(), unit="score")
+            self.monitor.on_train_batch_end(model_name=critic.name, key='score', value=real_score.mean().item(), unit="score")
+            self.monitor.on_train_batch_end(model_name=critic.name, key='wasserstein_distance', value=real_score.mean().item() - fake_score.mean().item(), unit="distance")
+            self.monitor.on_train_batch_end(model_name=critic.name, key='gradient_penalty', value=gp.item(), unit="penalty")
+            self.monitor.on_train_batch_end(model_name=generator.name, key='top3_entropy', value=entropy_k3, unit="entropy")
+
 
         avg_gen_loss = total_gen_loss / len(self.train_loader)
         avg_disc_loss = total_disc_loss / len(self.train_loader)
-        avg_gen_acc = total_gen_acc / len(self.train_loader)
-        avg_disc_acc = total_disc_acc / len(self.train_loader)
-        self.monitor.on_train_epoch_end(logs={'loss': avg_gen_loss, 'accuracy': avg_gen_acc}, model_name=generator.name)
-        self.monitor.on_train_epoch_end(logs={'loss': avg_disc_loss, 'accuracy': avg_disc_acc}, model_name=discriminator.name)
+
+        self.monitor.on_train_epoch_end(model_name=generator.name, key='loss', value=avg_gen_loss, unit="loss")
+        self.monitor.on_train_epoch_end(model_name=critic.name, key='loss', value=avg_disc_loss, unit="loss")
+        self.monitor.on_train_epoch_end(model_name=generator.name, key='step', value=gen_step, unit="steps")
+        self.monitor.on_train_epoch_end(model_name=critic.name, key='step', value=disc_step, unit="steps")
 
         print(f"Generator steps: {gen_step}, Discriminator steps: {disc_step}")
 
@@ -190,10 +190,8 @@ class TrainerGan:
 
         avg_gen_loss = total_gen_loss / len(self.val_loader)
         avg_disc_loss = total_disc_loss / len(self.val_loader)
-        avg_gen_acc = total_gen_acc / len(self.val_loader)
-        avg_disc_acc = total_disc_acc / len(self.val_loader)
 
-        self.monitor.on_val_epoch_end(logs={'loss': avg_gen_loss, 'accuracy': avg_gen_acc}, model_name=generator.name)
-        self.monitor.on_val_epoch_end(logs={'loss': avg_disc_loss, 'accuracy': avg_disc_acc}, model_name=discriminator.name)
+        self.monitor.on_val_epoch_end(model_name=generator.name, key='loss', value=avg_gen_loss, unit="loss")
+        self.monitor.on_val_epoch_end(model_name=discriminator.name, key='loss', value=avg_disc_loss, unit="loss")
 
         return avg_gen_loss, avg_disc_loss

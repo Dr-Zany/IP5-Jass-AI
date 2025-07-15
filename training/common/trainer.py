@@ -26,17 +26,16 @@ class Trainer:
 
     def train(self, epochs: int, model: ModelDNN, optimizer=None):
         signal(SIGINT, self._signal_handler)
-        self.monitor.set_model_name(model.name)
         print(f"Training model: {model.name}")
         for epoch in range(epochs):
             train_loss, train_accuracy = self._train_epoch(epoch, model, optimizer)
             val_loss, val_accuracy = self._validate_epoch(epoch, model)
             print(f"Epoch {epoch+1}/{epochs} - Train Loss: {train_loss:.4f}, Train Accuracy: {train_accuracy:.4f}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_accuracy:.4f}")
             
-            if val_loss < min(self.monitor.val_losses[model.name][:-1], default=float('inf')):
+            if val_loss < min(self.monitor.epoch_data_validation["loss"][model.name][:-1], default=float('inf')):
                 torch.save(model.state_dict(), self.model_path + f"/{model.name}.pth")
                 print(f"Model saved at epoch {epoch+1} with validation loss {val_loss:.4f}")
-            else:
+            elif [val_loss <= v for v in self.monitor.epoch_data_validation["loss"][model.name][:-1]].count(False) > 2:
                 break
 
             if self.stop_training:
@@ -63,11 +62,13 @@ class Trainer:
             total_loss += loss.item()
             batch_acc = self.accuracy_fn(logits, action)
             total_acc += batch_acc.item()
-            self.monitor.on_train_batch_end(logs={'loss': loss.item(), 'accuracy': batch_acc.item()})
+            self.monitor.on_train_batch_end(model_name=model.name, key='loss', value=loss.item(), unit="loss")
+            self.monitor.on_train_batch_end(model_name=model.name, key='accuracy', value=batch_acc.item() * 100, unit="percentage")
         
         avg_loss = total_loss / len(self.train_loader)
-        avg_accuracy = total_acc / len(self.train_loader)
-        self.monitor.on_train_epoch_end(logs={'loss': avg_loss, 'accuracy': avg_accuracy})
+        avg_accuracy = (total_acc / len(self.train_loader)) * 100
+        self.monitor.on_train_epoch_end(model_name=model.name, key='loss', value=avg_loss, unit="loss")
+        self.monitor.on_train_epoch_end(model_name=model.name, key='accuracy', value=avg_accuracy, unit="percentage")
         return avg_loss, avg_accuracy
     
     def _validate_epoch(self, epoch, model):
@@ -88,6 +89,7 @@ class Trainer:
                 total_acc += batch_acc.item()
 
         avg_loss = total_loss / len(self.val_loader)
-        avg_accuracy = total_acc / len(self.val_loader)
-        self.monitor.on_val_epoch_end(logs={'loss': avg_loss, 'accuracy': avg_accuracy})
+        avg_accuracy = (total_acc / len(self.val_loader)) * 100
+        self.monitor.on_val_epoch_end(model_name=model.name, key='loss', value=avg_loss , unit="loss")
+        self.monitor.on_val_epoch_end(model_name=model.name, key='accuracy', value=avg_accuracy , unit="percentage")
         return avg_loss, avg_accuracy

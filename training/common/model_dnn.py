@@ -2,10 +2,10 @@ import torch.nn as nn
 import torch
 
 class ModelDNN(nn.Module):
-    def __init__(self, name: str, input_size : int, embedding_size :int, hidden_size :list, output_size :int):
+    def __init__(self, name: str, input_size : int, embedding_size :int, hidden_size :list, output_size :int, embedding_num :int = 37):
         super(ModelDNN, self).__init__()
         self.name = name + "_" + "_".join(map(str, hidden_size)) + "_dnn"
-        self.embedding = nn.Embedding(input_size, embedding_size)
+        self.embedding = nn.Embedding(embedding_num, embedding_size)
         self.flat = nn.Flatten()
         dim_in = input_size * embedding_size
         layers = []

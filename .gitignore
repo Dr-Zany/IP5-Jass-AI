@@ -7,3 +7,5 @@ __pycache__
 *.pth
 *.onnx
 *.csv
+logs/
+models/

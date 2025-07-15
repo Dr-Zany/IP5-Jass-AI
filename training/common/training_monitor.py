@@ -1,86 +1,83 @@
 import matplotlib.pyplot as plt
+import matplotlib.gridspec as gridspec
+from math import ceil
 
 class TrainingMonitor:
     def __init__(self):
-        self.model_name = "default"
-        self.train_batch_losses = {}
-        self.train_batch_accuracies = {}
-        self.train_losses = {}
-        self.train_accuracies = {}
-        self.val_losses = {}
-        self.val_accuracies = {}
+        self.epoch_data_validation = {}
+        self.batch_data = {}
+        self.epoch_data = {}
 
-    def set_model_name(self, model_name):
-        self.model_name = model_name
-        self.train_batch_losses[model_name] = []
-        self.train_batch_accuracies[model_name] = []
-        self.train_losses[model_name] = []
-        self.train_accuracies[model_name] = []
-        self.val_losses[model_name] = []
-        self.val_accuracies[model_name] = []
+    def _add_structure_if_not_exists(self, data, key, model_name, unit):
+        if key not in data:
+            data[key] = {}
+            data[key]['unit'] = unit
+        if model_name not in data[key]:
+            data[key][model_name] = []
 
-    def on_train_batch_end(self, logs=None, model_name=None):
-        if model_name is None:
-            model_name = self.model_name
-        self.train_batch_losses[model_name].append(logs['loss'])
-        self.train_batch_accuracies[model_name].append(logs['accuracy'])
+    def on_train_batch_end(self, model_name, key, value, unit):
+        self._add_structure_if_not_exists(self.batch_data, key, model_name, unit)
+        self.batch_data[key][model_name].append(value)
 
-    def on_train_epoch_end(self, logs=None, model_name=None):
-        if model_name is None:
-            model_name = self.model_name
-        self.train_losses[model_name].append(logs['loss'])
-        self.train_accuracies[model_name].append(logs['accuracy'])
+    def on_train_epoch_end(self, model_name, key, value, unit):
+        self._add_structure_if_not_exists(self.epoch_data, key, model_name, unit)
+        self.epoch_data[key][model_name].append(value)
 
-    def on_val_epoch_end(self, logs=None, model_name=None):
-        if model_name is None:
-            model_name = self.model_name
-        self.val_losses[model_name].append(logs['loss'])
-        self.val_accuracies[model_name].append(logs['accuracy'])
+    def on_val_epoch_end(self, model_name, key, value, unit):
+        self._add_structure_if_not_exists(self.epoch_data_validation, key, model_name, unit)
+        self.epoch_data_validation[key][model_name].append(value)
 
-    def dump(self, dump_path):
-        for model_name in self.train_losses.keys():
-            with open(f"{dump_path}/{model_name}_monitor.csv", 'w') as f:
-                f.write("train_loss,train_accuracy,val_loss,val_accuracy\n")
-                for i in range(len(self.train_losses[model_name])):
-                    f.write(f"{self.train_losses[model_name][i]},{self.train_accuracies[model_name][i]},{self.val_losses[model_name][i]},{self.val_accuracies[model_name][i]}\n")
+    def dump(self, dump_path, filename="monitor"):
+        def _dump(data, prefix):
+            for key, values in data.items():
+                with open(f"{dump_path}/{filename}_{prefix}_{key}.csv", "w") as f:
+                    for model_name, value_list in values.items():
+                        if model_name == "unit":
+                            continue
+                        f.write(f"{model_name}," + ",".join(map(str, value_list)) + "\n")
 
-
+        _dump(self.epoch_data, "epoch")
+        _dump(self.epoch_data_validation, "val_epoch")
+        _dump(self.batch_data, "batch")
 
     def plot(self):
-        plt.figure(figsize=(12, 5))
-        plt.subplot(2, 2, 1)
-        for model_name in self.train_losses.keys():
-            plt.plot(self.train_losses[model_name], label=f'Train Loss {model_name}')
-            plt.plot(self.val_losses[model_name], label=f'Validation Loss {model_name}')
-        plt.title('Loss')
-        plt.xlabel('Epochs')
-        plt.ylabel('Loss')
-        plt.legend()
+        def _plot_metric(ax, data, title, xlabel, ylabel):
+            for model_name, values in data.items():
+                if model_name == "unit":
+                    continue
+                ax.plot(values, label=model_name)
+            ax.set_title(title)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel(ylabel)
+            ax.legend()
+            ax.grid(True)
 
-        plt.subplot(2, 2, 2)
-        for model_name in self.train_accuracies.keys():
-            plt.plot(self.train_accuracies[model_name], label=f'Train Accuracy {model_name}')
-            plt.plot(self.val_accuracies[model_name], label=f'Validation Accuracy {model_name}')
-        plt.title('Accuracy')
-        plt.xlabel('Epochs')
-        plt.ylabel('Accuracy')
-        plt.legend()
+        def _plot_key(data, idx, gs, title, xlabel, span_cols=1):
+            for key, values in data.items():
+                row = idx // 2
+                col = idx % 2
+                if span_cols == 2:
+                    ax = fig.add_subplot(gs[row, :])
+                else:
+                    ax = fig.add_subplot(gs[row, col])
+                _plot_metric(ax, values, f"{title} - {key}", xlabel, ylabel=f"{key} in {values['unit']}")
+                idx += span_cols
+            return idx
 
-        plt.subplot(2, 2, 3)
-        for model_name in self.train_batch_losses.keys():
-            plt.plot(self.train_batch_losses[model_name], label=f'Train Batch Loss {model_name}')
-        plt.title('Batch Loss')
-        plt.xlabel('Batch')
-        plt.ylabel('Loss')
-        plt.legend()
+        n_epoch = len(self.epoch_data) # 2 prints per row
+        n_val = len(self.epoch_data_validation) # 2 prints per row
+        n_batch = len(self.batch_data) # 1 print per row
+        rows = ceil(n_epoch / 2) + ceil(n_val / 2) + n_batch
 
-        plt.subplot(2, 2, 4)
-        for model_name in self.train_batch_accuracies.keys():
-            plt.plot(self.train_batch_accuracies[model_name], label=f'Train Batch Accuracy {model_name}')
-        plt.title('Batch Accuracy')
-        plt.xlabel('Batch')
-        plt.ylabel('Accuracy')
-        plt.legend()
+        fig = plt.figure(figsize=(12, 4 * rows))
+        gs = gridspec.GridSpec(rows, 2)
+
+        idx = 0
+        _plot_key(self.epoch_data, idx, gs, "Training", "Epoch", span_cols=1)
+        idx += n_epoch + n_epoch % 2  # Ensure Validation starts on a new row if n_epoch is odd
+        _plot_key(self.epoch_data_validation, idx, gs, "Validation", "Epoch", span_cols=1)
+        idx += n_val + n_val % 2 # Ensure Batch starts on a new row if n_val is odd
+        _plot_key(self.batch_data, idx, gs, "Training", "Batch", span_cols=2)
+
         plt.tight_layout()
-
         plt.show()

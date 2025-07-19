@@ -1,6 +1,7 @@
 import matplotlib.pyplot as plt
 import matplotlib.gridspec as gridspec
 from math import ceil
+import os
 
 class TrainingMonitor:
     def __init__(self):
@@ -39,6 +40,26 @@ class TrainingMonitor:
         _dump(self.epoch_data, "epoch")
         _dump(self.epoch_data_validation, "val_epoch")
         _dump(self.batch_data, "batch")
+
+    def load(self, dump_path, filename="monitor"):
+        def _load(data, prefix):
+            # go throug all files in the dump_path with the prefix
+            for file_name in os.listdir(dump_path):
+                if not file_name.startswith(f"{filename}_{prefix}_") or not file_name.endswith(".csv"):
+                    continue
+                key = file_name[len(f"{filename}_{prefix}_"):-len(".csv")]
+                with open(f"{dump_path}/{file_name}", "r") as f:
+                    for line in f:
+                        parts = line.strip().split(",")
+                        model_name = parts[0]
+                        values = list(map(float, parts[1:]))
+                        unit = "procentage" if key == "accaurcy" else key
+                        self._add_structure_if_not_exists(data, key, model_name, unit)
+                        data[key][model_name] = values
+
+        _load(self.epoch_data, "epoch")
+        _load(self.epoch_data_validation, "val_epoch")  
+        _load(self.batch_data, "batch")
 
     def plot(self):
         def _plot_metric(ax, data, title, xlabel, ylabel):

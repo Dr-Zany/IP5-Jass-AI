@@ -65,7 +65,7 @@ So, the complete input state is a 936-dimensional after the embedding.
 ### Encoding Details
 
 - **36 dimensions Card Vector:**  
-  Each card is encoded in a 36-dimensional vector, where each dimension corresponds to a specific card. The encoding is as follows:
+  Each card is encoded in a 37-dimensional vector, where each dimension corresponds to a specific card. The encoding is as follows:
    ```
    +-----------------------------+
    |  36 - 28:   Spades   ♠      |

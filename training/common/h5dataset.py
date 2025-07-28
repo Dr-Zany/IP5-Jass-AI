@@ -8,6 +8,7 @@ numpy_to_torch_dtype_dict = {
     np.int8       : torch.long,
     np.int16      : torch.long,
     np.int32      : torch.long,
+    np.uint32     : torch.long,
     np.int64      : torch.long,
     np.float16    : torch.float,
     np.float32    : torch.float,

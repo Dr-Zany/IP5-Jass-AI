@@ -29,3 +29,35 @@ class ModelDNN(nn.Module):
     def forward_layers(self, x) -> torch.Tensor:
         x = self.layers(x)
         return x
+    
+class ModelDNNWithScore(nn.Module):
+    def __init__(self, name: str, input_size : int, embedding_size :int, hidden_size :list, output_size :int, embedding_num :int = 37):
+        super(ModelDNNWithScore, self).__init__()
+        self.name = name + "_" + "_".join(map(str, hidden_size)) + "_dnn"
+        self.embedding = nn.Embedding(embedding_num, embedding_size)
+        self.flat = nn.Flatten()
+        dim_in = (input_size - 1) * embedding_size + 1
+        layers = []
+        for h in hidden_size:
+            layers.append(nn.Linear(dim_in, h))
+            layers.append(nn.ReLU())
+            dim_in = h
+        layers.append(nn.Linear(dim_in, output_size))
+        self.layers = nn.Sequential(*layers)
+        
+    def forward(self, x) -> torch.Tensor:
+        # split the last column for score
+        x, score = x[:, :-1], x[:, -1]
+        x = self.forward_embedded(x)
+        x = torch.cat((x, score.unsqueeze(1)), dim=1)
+        x = self.forward_layers(x)
+        return x
+    
+    def forward_embedded(self, x) -> torch.Tensor:
+        x = self.embedding(x)
+        x = self.flat(x)
+        return x
+    
+    def forward_layers(self, x) -> torch.Tensor:
+        x = self.layers(x)
+        return x

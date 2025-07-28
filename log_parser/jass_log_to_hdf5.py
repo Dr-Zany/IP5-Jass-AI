@@ -5,6 +5,7 @@ import re
 import logging
 import os
 from typing import List, Dict, Any, Optional, Tuple
+import tqdm
 
 NUM_CARDS_HAND = 9
 NUM_CARDS_TABLE = 3
@@ -15,12 +16,12 @@ NUM_TRUMPS = 1
 NUM_STATE = NUM_CARDS_HAND + NUM_CARDS_TABLE + NUM_CARDS_HISTORY + NUM_CARDS_SHOWN + NUM_TRUMPS # 1 for trump, 9 for each player, 32 for history, 27 for shown cards
 
 # --- Logging Configuration ---
+
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s',
                     datefmt='%Y-%m-%d %H:%M:%S',
                     handlers=[
                         logging.FileHandler("jass_log_parser.log"), # Log to a file
-                        logging.StreamHandler() # Also log to console
                     ])
 
 # --- Regex Definitions ---
@@ -31,6 +32,7 @@ r_setTrump = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"p
 r_playCard = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":{\"submitsCard\":\s*\"(\d+)\"', re.IGNORECASE)
 r_cardShow = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":{\"doRequestSuits\":\s*\[".*?;((?:\d+,?)+)"',re.IGNORECASE)
 r_gameEnd = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":\s*\"gameFinished\"}', re.IGNORECASE)
+r_point = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}[+-]\d{4})\s.*\"pid\":\s*\"([\w\d]+)\",\"action\":{.*?\"gameTotal\":\s\[Rundentotal,(\d+),\d+\]', re.IGNORECASE)
 
 # --- State Functions ---
 def create_state(hand: List[int], table: List[int], history: List[int], shown: List[List[int]], trump: int) -> List[int]:
@@ -65,6 +67,25 @@ def create_state(hand: List[int], table: List[int], history: List[int], shown: L
 
     return state
 
+def create_state_with_points(hand: List[int], table: List[int], history: List[int], shown: List[List[int]], trump: int, points: int) -> List[int]:
+    """
+    Create a state representation for the Jass game with points.
+
+    Args:
+        hand (List[int]): Cards in hand.
+        table (List[int]): Cards on the table.
+        history (List[int]): Cards in history.
+        shown (List[List[int]]): Cards shown by each player.
+        trump (int): Trump suit.
+        points (int): Points for the player.
+
+    Returns:
+        List[int]: State representation as a list of integers.
+    """
+    state = create_state(hand, table, history, shown, trump)
+    state.append(points)  # Append points to the state
+    return state
+
 def create_action(card: int, hand: list[int]) -> int:
     """
     Create an action representation for the Jass game.
@@ -80,7 +101,7 @@ def create_action(card: int, hand: list[int]) -> int:
 
 
 # --- Parser Functions ---
-def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5_time: h5py.File) -> int:
+def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5_time: h5py.File, hdf5_play_with_points: h5py.File, hdf5_trump_with_points: h5py.File) -> int:
     """
     Parse the Jass log file and store the data in an HDF5 file.
 
@@ -95,13 +116,16 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
     player_ids_in_game: List[str] = []
     found_all_players = False # Flag to track if player info is complete for this game
 
-
+    group_play_with_points = hdf5_play_with_points.create_group(game_group_name)
+    group_trump_with_points = hdf5_trump_with_points.create_group(game_group_name)
     group_play = hdf5_play.create_group(game_group_name)
     group_trump = hdf5_trump.create_group(game_group_name)
     group_time = hdf5_time.create_group(game_group_name)
     logging.debug(f"Created HDF5 group: /{game_group_name}")
 
     dset_state_play = group_play.create_dataset("state", (0, NUM_STATE), maxshape=(None, NUM_STATE), chunks=(1,NUM_STATE), dtype='uint8', compression="gzip")
+    dset_state_play_with_points = group_play_with_points.create_dataset("state", (0, NUM_STATE + 1), maxshape=(None, NUM_STATE + 1), chunks=(1,NUM_STATE + 1), dtype='uint32', compression="gzip")
+    dset_state_trump_with_points = group_trump_with_points.create_dataset("state", (0, 10 + 1), maxshape=(None, 10 + 1), chunks=True, dtype='uint32', compression="gzip")
     dset_state_trump = group_trump.create_dataset("state", (0, 10), maxshape=(None, 10), chunks=True, dtype='uint8', compression="gzip")
     dset_state_time = group_time.create_dataset("state", (0, NUM_STATE), maxshape=(None, NUM_STATE), chunks=(1,NUM_STATE), dtype='uint8', compression="gzip")
 
@@ -110,11 +134,14 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
     dset_player_info_time = group_time.create_dataset("player_info", (0, 1), maxshape=(None, 1), chunks=True, dtype=h5py.string_dtype(length=32), compression="gzip")
 
     dset_action_play = group_play.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
+    dset_action_play_with_points = group_play_with_points.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
+    dset_action_trump_with_points = group_trump_with_points.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
     dset_action_trump = group_trump.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
     dset_action_time = group_time.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='float', compression="gzip")
 
     time_last_action: Optional[datetime] = None
     player_order: Dict[str, int] = {} # Maps player IDs to their order in the game
+    player_points: Dict[str, int] = {} # Points for each player
     hands: Dict[str, List[int]] = {} # Current cards in each player's hand
     shown: List[List[int]] = {} # Cards shown by each player (so called "Weiss")
     history: List[int] = [] # Cards from completed tricks in the current round
@@ -262,6 +289,7 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
 
                         current_size_trump = dset_state_trump.shape[0]
                         dset_state_trump.resize(current_size_trump + 1, axis=0)
+                        dset_state_trump_with_points.resize(current_size_trump + 1, axis=0)
                         dset_player_info_trump.resize(current_size_trump + 1, axis=0)
                         dset_action_trump.resize(current_size_trump + 1, axis=0)
 
@@ -270,7 +298,9 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                         dset_player_info_time.resize(current_size_time + 1, axis=0)
                         dset_action_time.resize(current_size_time + 1, axis=0)
 
-                        dset_state_trump[current_size_trump:] = hands[player_id] + [int(trump_pushed)]
+                        dset_state_trump[current_size_trump:] = hands[player_id] + [int(trump_pushed)]                       
+                        dset_state_trump_with_points[current_size_trump,:] = hands[player_id] + [int(trump_pushed), int(player_points.get(player_id, 0))] # Add points if available
+                        dset_action_trump_with_points[current_size_trump:] = [trump_val]
                         dset_player_info_trump[current_size_trump] = player_id
                         dset_action_trump[current_size_trump:] = [trump_val]
                         saved_states_trump += 1
@@ -289,6 +319,7 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                         if time_last_action is None or trump_time > time_last_action:
                              time_last_action = trump_time
                     except (ValueError, IndexError) as e:
+                        print(hands[player_id] + [int(trump_pushed), int(player_points.get(player_id, 0))])
                         logging.error(f"Line {line_count}: Error parsing trump setting ({e}). Skipping.")
                     continue
 
@@ -337,10 +368,12 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                         # --- Create State (Player's perspective BEFORE playing) ---
                     
                         current_hand = list(hands[player_id])
+                        current_points = player_points.get(player_id, 0)
                         current_history = list(history)
                         current_table_cards_only = list(current_trick_cards)
 
                         state = create_state(current_hand, current_table_cards_only, current_history, card_shown, trump)
+                        state_with_points = create_state_with_points(current_hand, current_table_cards_only, current_history, card_shown, trump, current_points)
 
                         # --- Create Action ---
                         action = create_action(card_played, current_hand)
@@ -352,6 +385,8 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                         dset_state_play.resize(current_size_play + 1, axis=0)
                         dset_player_info_play.resize(current_size_play + 1, axis=0)
                         dset_action_play.resize(current_size_play + 1, axis=0)
+                        dset_state_play_with_points.resize(current_size_play + 1, axis=0)
+                        dset_action_play_with_points.resize(current_size_play + 1, axis=0)
 
                         current_size_time = dset_state_time.shape[0]
                         dset_state_time.resize(current_size_time + 1, axis=0)
@@ -360,6 +395,8 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                         dset_state_time[current_size_time:] = state
 
                         # Append data to the last row
+                        dset_state_play_with_points[current_size_play:] = state_with_points
+                        dset_action_play_with_points[current_size_play:] = [action]
                         dset_state_play[current_size_play:] = state
                         dset_player_info_play[current_size_play] = player_id
                         dset_action_play[current_size_play:] = action
@@ -409,6 +446,25 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                          discarded = True
                          break # Critical error, break out of loop
                     continue # Ensure we move to the next line even if errors 
+
+                # Match Player Points (Game End)
+                m_point = r_point.match(line)
+                if m_point:
+                    try:
+                        point_time = datetime.strptime(m_point.group(1), "%Y-%m-%d %H:%M:%S%z")
+                        player_id = m_point.group(2)
+                        points = int(m_point.group(3))
+
+                        if player_id not in player_ids_in_game:
+                            logging.warning(f"Line {line_count}: Player {player_id} points but not in known players {player_ids_in_game}. Points ignored.")
+                            continue
+
+                        player_points[player_id] = points
+                        logging.debug(f"Player {player_id} scored {points} points.")
+
+                    except (ValueError, IndexError) as e:
+                        logging.error(f"Line {line_count}: Error parsing player points ({e}). Skipping.")
+                    continue
                 
                 # Match Game End
                 m_end = r_gameEnd.match(line)
@@ -427,8 +483,11 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
 
     # Add final attributes after processing the file
     group_play.attrs['total_states_saved'] = saved_states_play
+    group_play_with_points.attrs['total_states_saved'] = saved_states_play
     group_trump.attrs['total_states_saved'] = saved_states_trump
+    group_trump_with_points.attrs['total_states_saved'] = saved_states_trump
     group_time.attrs['total_states_saved'] = saved_states_time
+
     if not found_all_players and saved_states_play > 0:
          logging.warning(f"Finished processing {filename}, but player info might be incomplete. Saved {saved_states_play},{saved_states_time},{saved_states_trump} states.")
     elif saved_states_play > 0:
@@ -441,11 +500,15 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
         del hdf5_play[game_group_name] # Remove the group from HDF5 file
         del hdf5_trump[game_group_name]
         del hdf5_time[game_group_name]
+        del hdf5_play_with_points[game_group_name]
+        del hdf5_trump_with_points[game_group_name]
         return (0, 0, 0) # Return zero states saved
     
     hdf5_play.flush()
     hdf5_trump.flush()
     hdf5_time.flush()
+    hdf5_play_with_points.flush()
+    hdf5_trump_with_points.flush()
     return (saved_states_play, saved_states_trump, saved_states_time)
 
 
@@ -466,9 +529,11 @@ if __name__ == "__main__":
     play_file = os.path.join(args.output_dir, "playing.hdf5")
     trump_file = os.path.join(args.output_dir, "trump.hdf5")
     time_file = os.path.join(args.output_dir, "time.hdf5")
+    play_file_with_points = os.path.join(args.output_dir, "playing_with_points.hdf5")
+    trump_file_with_points = os.path.join(args.output_dir, "trump_with_points.hdf5")
 
     try:
-        with h5py.File(play_file, 'a') as hdf5_playing, h5py.File(trump_file, 'a') as hdf5_trump, h5py.File(time_file, 'a') as hdf5_time:
+        with h5py.File(play_file, 'a') as hdf5_playing, h5py.File(trump_file, 'a') as hdf5_trump, h5py.File(time_file, 'a') as hdf5_time, h5py.File(play_file_with_points, 'a') as hdf5_playing_with_points, h5py.File(trump_file_with_points, 'a') as hdf5_trump_with_points:
             input_files = [f for f in os.listdir(args.input_dir) if f.endswith('.game')]
             num_states_played = 0
             num_states_trump = 0
@@ -476,20 +541,20 @@ if __name__ == "__main__":
             if args.num_files > 0:
                 input_files = input_files[:args.num_files]
             counter = 0
-            for filename in input_files:
+            for filename in tqdm.tqdm(input_files, desc="Processing files", unit="file"):
                 file_path = os.path.join(args.input_dir, filename)
-                states_played, states_trump, states_time = parse_file(file_path, hdf5_playing, hdf5_trump, hdf5_time)
+                states_played, states_trump, states_time = parse_file(file_path, hdf5_playing, hdf5_trump, hdf5_time, hdf5_playing_with_points, hdf5_trump_with_points)
                 num_states_played += states_played
                 num_states_trump += states_trump
                 num_states_time += states_time
                 counter += 1
-                if counter % 100 == 0:
-                    logging.info(f"Processed {counter} files of {len(input_files)}. Total states saved so far: {num_states_played}, {num_states_trump}, {num_states_time}.")
 
             logging.info(f"Total states saved: {num_states_played}")
 
             hdf5_playing.attrs['total_states_saved'] = num_states_played
+            hdf5_playing_with_points.attrs['total_states_saved'] = num_states_played
             hdf5_trump.attrs['total_states_saved'] = num_states_trump
+            hdf5_trump_with_points.attrs['total_states_saved'] = num_states_trump
             hdf5_time.attrs['total_states_saved'] = num_states_time
     
     except Exception as e:

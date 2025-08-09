@@ -36,7 +36,7 @@ class ModelDNNWithScore(nn.Module):
         self.name = name + "_" + "_".join(map(str, hidden_size)) + "_dnn"
         self.embedding = nn.Embedding(embedding_num, embedding_size)
         self.flat = nn.Flatten()
-        dim_in = (input_size - 1) * embedding_size + 1
+        dim_in = (input_size - 2) * embedding_size + 2
         layers = []
         for h in hidden_size:
             layers.append(nn.Linear(dim_in, h))
@@ -47,9 +47,9 @@ class ModelDNNWithScore(nn.Module):
         
     def forward(self, x) -> torch.Tensor:
         # split the last column for score
-        x, score = x[:, :-1], x[:, -1]
+        x, scores = x[:, :-2], x[:, -2:]
         x = self.forward_embedded(x)
-        x = torch.cat((x, score.unsqueeze(1)), dim=1)
+        x = torch.cat((x, scores), dim=1)
         x = self.forward_layers(x)
         return x
     

@@ -1,8 +1,20 @@
 import torch
 import torch.onnx
 import os
+import torch.nn.functional as F
 
-def onnx_exporter(model, output_path, in_dim, batch_size=1, max_value=36):
+class ExportModelWrapper(torch.nn.Module):
+    def __init__(self, model: torch.nn.Module, decision_fn):
+        super().__init__()
+        self.model = model
+        self.decision_fn = decision_fn
+
+    def forward(self, x):
+        logits = self.model(x)
+        return self.decision_fn(logits, dim=-1)
+
+
+def onnx_exporter(model, decision_fn, output_path, in_dim, batch_size=1, max_value=36):
     """
     Export a PyTorch model to ONNX format.
     
@@ -12,8 +24,10 @@ def onnx_exporter(model, output_path, in_dim, batch_size=1, max_value=36):
     :param out_dim: Output dimension of the model.
     :param batch_size: Batch size for the dummy input tensor.
     """
-    
     model.eval()
+    export_model = ExportModelWrapper(model, decision_fn)
+
+    
     # Create dummy input tensors
     dummy_input = torch.randint(0, max_value, (batch_size, in_dim), dtype=torch.long)
 
@@ -31,7 +45,7 @@ def onnx_exporter(model, output_path, in_dim, batch_size=1, max_value=36):
     print("Exporting model to ONNX format...")
     try:
         torch.onnx.export(
-            model,
+            export_model,
             dummy_input,
             output_path,
             export_params=True,

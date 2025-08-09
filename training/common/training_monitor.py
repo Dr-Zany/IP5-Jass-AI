@@ -16,15 +16,15 @@ class TrainingMonitor:
         if model_name not in data[key]:
             data[key][model_name] = []
 
-    def on_train_batch_end(self, model_name, key, value, unit):
+    def on_train_batch_end(self, model_name, key, value, unit=None):
         self._add_structure_if_not_exists(self.batch_data, key, model_name, unit)
         self.batch_data[key][model_name].append(value)
 
-    def on_train_epoch_end(self, model_name, key, value, unit):
+    def on_train_epoch_end(self, model_name, key, value, unit=None):
         self._add_structure_if_not_exists(self.epoch_data, key, model_name, unit)
         self.epoch_data[key][model_name].append(value)
 
-    def on_val_epoch_end(self, model_name, key, value, unit):
+    def on_val_epoch_end(self, model_name, key, value, unit=None):
         self._add_structure_if_not_exists(self.epoch_data_validation, key, model_name, unit)
         self.epoch_data_validation[key][model_name].append(value)
 
@@ -53,7 +53,7 @@ class TrainingMonitor:
                         parts = line.strip().split(",")
                         model_name = parts[0]
                         values = list(map(float, parts[1:]))
-                        unit = "procentage" if key == "accaurcy" else key
+                        unit = "percent" if key == "accuracy" else None
                         self._add_structure_if_not_exists(data, key, model_name, unit)
                         data[key][model_name] = values
 
@@ -81,7 +81,8 @@ class TrainingMonitor:
                     ax = fig.add_subplot(gs[row, :])
                 else:
                     ax = fig.add_subplot(gs[row, col])
-                _plot_metric(ax, values, f"{title} - {key}", xlabel, ylabel=f"{key} in {values['unit']}")
+                ylabel = f"{key} in {values['unit']}" if values['unit'] != None else f"{key}"
+                _plot_metric(ax, values, f"{title} - {key}", xlabel, ylabel=ylabel)
                 idx += span_cols
             return idx
 

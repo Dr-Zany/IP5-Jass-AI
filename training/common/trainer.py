@@ -62,13 +62,13 @@ class Trainer:
             total_loss += loss.item()
             batch_acc = self.accuracy_fn(logits, action)
             total_acc += batch_acc.item()
-            self.monitor.on_train_batch_end(model_name=model.name, key='loss', value=loss.item(), unit="loss")
-            self.monitor.on_train_batch_end(model_name=model.name, key='accuracy', value=batch_acc.item() * 100, unit="percentage")
+            self.monitor.on_train_batch_end(model_name=model.name, key='loss', value=loss.item())
+            self.monitor.on_train_batch_end(model_name=model.name, key='accuracy', value=batch_acc.item() * 100, unit="percent")
         
         avg_loss = total_loss / len(self.train_loader)
         avg_accuracy = (total_acc / len(self.train_loader)) * 100
-        self.monitor.on_train_epoch_end(model_name=model.name, key='loss', value=avg_loss, unit="loss")
-        self.monitor.on_train_epoch_end(model_name=model.name, key='accuracy', value=avg_accuracy, unit="percentage")
+        self.monitor.on_train_epoch_end(model_name=model.name, key='loss', value=avg_loss)
+        self.monitor.on_train_epoch_end(model_name=model.name, key='accuracy', value=avg_accuracy, unit="percent")
         return avg_loss, avg_accuracy
     
     def _validate_epoch(self, epoch, model):
@@ -90,6 +90,6 @@ class Trainer:
 
         avg_loss = total_loss / len(self.val_loader)
         avg_accuracy = (total_acc / len(self.val_loader)) * 100
-        self.monitor.on_val_epoch_end(model_name=model.name, key='loss', value=avg_loss , unit="loss")
-        self.monitor.on_val_epoch_end(model_name=model.name, key='accuracy', value=avg_accuracy , unit="percentage")
+        self.monitor.on_val_epoch_end(model_name=model.name, key='loss', value=avg_loss)
+        self.monitor.on_val_epoch_end(model_name=model.name, key='accuracy', value=avg_accuracy , unit="percent")
         return avg_loss, avg_accuracy

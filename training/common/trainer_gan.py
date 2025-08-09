@@ -119,7 +119,7 @@ class TrainerGan:
             prev_gen_loss = gen_loss.item()
 
             # Dynamic balancing: choose the slower learning network to update
-            if self.balance_lambda * r_g < r_d:
+            if self.balance_lambda * r_g < r_d and gen_step * 5 >= disc_step:
                 disc_step += 1
                 disc_loss.backward()
                 torch.nn.utils.clip_grad_norm_(critic.parameters(), max_norm=1.0)
@@ -135,22 +135,22 @@ class TrainerGan:
             entropy_k3 = self._topk_entropy(logits, k=3)
 
 
-            self.monitor.on_train_batch_end(model_name=generator.name, key='loss', value=gen_loss.item(), unit="loss")
-            self.monitor.on_train_batch_end(model_name=critic.name, key='loss', value=disc_loss.item(), unit="loss")
-            self.monitor.on_train_batch_end(model_name=generator.name, key='score', value=fake_score.mean().item(), unit="score")
-            self.monitor.on_train_batch_end(model_name=critic.name, key='score', value=real_score.mean().item(), unit="score")
-            self.monitor.on_train_batch_end(model_name=critic.name, key='wasserstein_distance', value=real_score.mean().item() - fake_score.mean().item(), unit="distance")
-            self.monitor.on_train_batch_end(model_name=critic.name, key='gradient_penalty', value=gp.item(), unit="penalty")
-            self.monitor.on_train_batch_end(model_name=generator.name, key='top3_entropy', value=entropy_k3, unit="entropy")
+            self.monitor.on_train_batch_end(model_name=generator.name, key='loss', value=gen_loss.item())
+            self.monitor.on_train_batch_end(model_name=critic.name, key='loss', value=disc_loss.item())
+            self.monitor.on_train_batch_end(model_name=generator.name, key='score', value=fake_score.mean().item())
+            self.monitor.on_train_batch_end(model_name=critic.name, key='score', value=real_score.mean().item())
+            self.monitor.on_train_batch_end(model_name=critic.name, key='wasserstein_distance', value=real_score.mean().item() - fake_score.mean().item())
+            self.monitor.on_train_batch_end(model_name=critic.name, key='gradient_penalty', value=gp.item())
+            self.monitor.on_train_batch_end(model_name=generator.name, key='top3_entropy', value=entropy_k3)
 
 
         avg_gen_loss = total_gen_loss / len(self.train_loader)
         avg_disc_loss = total_disc_loss / len(self.train_loader)
 
-        self.monitor.on_train_epoch_end(model_name=generator.name, key='loss', value=avg_gen_loss, unit="loss")
-        self.monitor.on_train_epoch_end(model_name=critic.name, key='loss', value=avg_disc_loss, unit="loss")
-        self.monitor.on_train_epoch_end(model_name=generator.name, key='step', value=gen_step, unit="steps")
-        self.monitor.on_train_epoch_end(model_name=critic.name, key='step', value=disc_step, unit="steps")
+        self.monitor.on_train_epoch_end(model_name=generator.name, key='loss', value=avg_gen_loss)
+        self.monitor.on_train_epoch_end(model_name=critic.name, key='loss', value=avg_disc_loss)
+        self.monitor.on_train_epoch_end(model_name=generator.name, key='step', value=gen_step)
+        self.monitor.on_train_epoch_end(model_name=critic.name, key='step', value=disc_step)
 
         print(f"Generator steps: {gen_step}, Discriminator steps: {disc_step}")
 
@@ -191,7 +191,7 @@ class TrainerGan:
         avg_gen_loss = total_gen_loss / len(self.val_loader)
         avg_disc_loss = total_disc_loss / len(self.val_loader)
 
-        self.monitor.on_val_epoch_end(model_name=generator.name, key='loss', value=avg_gen_loss, unit="loss")
-        self.monitor.on_val_epoch_end(model_name=discriminator.name, key='loss', value=avg_disc_loss, unit="loss")
+        self.monitor.on_val_epoch_end(model_name=generator.name, key='loss', value=avg_gen_loss)
+        self.monitor.on_val_epoch_end(model_name=discriminator.name, key='loss', value=avg_disc_loss)
 
         return avg_gen_loss, avg_disc_loss

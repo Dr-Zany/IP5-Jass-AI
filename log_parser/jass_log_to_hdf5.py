@@ -102,7 +102,7 @@ def create_action(card: int, hand: list[int]) -> int:
 
 
 # --- Parser Functions ---
-def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5_time: h5py.File, hdf5_play_with_points: h5py.File, hdf5_trump_with_points: h5py.File) -> int:
+def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5_time: h5py.File, hdf5_play_with_points: h5py.File, hdf5_trump_with_points: h5py.File, hdf5_play_cheated: h5py.File) -> int:
     """
     Parse the Jass log file and store the data in an HDF5 file.
 
@@ -119,6 +119,7 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
 
     group_play_with_points = hdf5_play_with_points.create_group(game_group_name)
     group_trump_with_points = hdf5_trump_with_points.create_group(game_group_name)
+    group_play_cheated = hdf5_play_cheated.create_group(game_group_name)
     group_play = hdf5_play.create_group(game_group_name)
     group_trump = hdf5_trump.create_group(game_group_name)
     group_time = hdf5_time.create_group(game_group_name)
@@ -126,6 +127,7 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
 
     dset_state_play = group_play.create_dataset("state", (0, NUM_STATE), maxshape=(None, NUM_STATE), chunks=(1,NUM_STATE), dtype='uint8', compression="gzip")
     dset_state_play_with_points = group_play_with_points.create_dataset("state", (0, NUM_STATE + 2), maxshape=(None, NUM_STATE + 2), chunks=(1,NUM_STATE + 2), dtype='uint32', compression="gzip")
+    dset_state_play_cheated = group_play_cheated.create_dataset("state", (0, NUM_STATE), maxshape=(None, NUM_STATE), chunks=(1,NUM_STATE), dtype='uint8', compression="gzip")
     dset_state_trump_with_points = group_trump_with_points.create_dataset("state", (0, 10 + 2), maxshape=(None, 10 + 2), chunks=True, dtype='uint32', compression="gzip")
     dset_state_trump = group_trump.create_dataset("state", (0, 10), maxshape=(None, 10), chunks=True, dtype='uint8', compression="gzip")
     dset_state_time = group_time.create_dataset("state", (0, NUM_STATE), maxshape=(None, NUM_STATE), chunks=(1,NUM_STATE), dtype='uint8', compression="gzip")
@@ -136,6 +138,7 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
 
     dset_action_play = group_play.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
     dset_action_play_with_points = group_play_with_points.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
+    dset_action_play_cheated = group_play_cheated.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
     dset_action_trump_with_points = group_trump_with_points.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
     dset_action_trump = group_trump.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='uint8', compression="gzip")
     dset_action_time = group_time.create_dataset("action", (0, 1), maxshape=(None, 1), chunks=True, dtype='float', compression="gzip")
@@ -376,6 +379,12 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                         current_table_cards_only = list(current_trick_cards)
 
                         state = create_state(current_hand, current_table_cards_only, current_history, card_shown, trump)
+                        # iterate over hands in player order to create the shown cards
+                        shown_cards_cheated = [hands[pid] for pid in sorted(player_order, key=player_order.get)]
+                        shown_cards_cheated = shown_cards_cheated[:player_order[player_id]] + shown_cards_cheated[player_order[player_id]+1:] # Exclude the current player
+                        shown_cards_cheated = shown_cards_cheated[player_order[player_id]:] + shown_cards_cheated[:player_order[player_id]] # Rotate to match player order
+
+                        state_cheated = create_state(current_hand, current_table_cards_only, current_history, shown_cards_cheated, trump)
                         state_with_points = create_state_with_points(current_hand, current_table_cards_only, current_history, card_shown, trump, current_points, other_points)
 
                         # --- Create Action ---
@@ -390,6 +399,8 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                         dset_action_play.resize(current_size_play + 1, axis=0)
                         dset_state_play_with_points.resize(current_size_play + 1, axis=0)
                         dset_action_play_with_points.resize(current_size_play + 1, axis=0)
+                        dset_state_play_cheated.resize(current_size_play + 1, axis=0)
+                        dset_action_play_cheated.resize(current_size_play + 1, axis=0)
 
                         current_size_time = dset_state_time.shape[0]
                         dset_state_time.resize(current_size_time + 1, axis=0)
@@ -400,6 +411,8 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
                         # Append data to the last row
                         dset_state_play_with_points[current_size_play:] = state_with_points
                         dset_action_play_with_points[current_size_play:] = [action]
+                        dset_state_play_cheated[current_size_play:] = state_cheated
+                        dset_action_play_cheated[current_size_play:] = [action]
                         dset_state_play[current_size_play:] = state
                         dset_player_info_play[current_size_play] = player_id
                         dset_action_play[current_size_play:] = action
@@ -487,9 +500,11 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
     # Add final attributes after processing the file
     group_play.attrs['total_states_saved'] = saved_states_play
     group_play_with_points.attrs['total_states_saved'] = saved_states_play
+    group_play_cheated.attrs['total_states_saved'] = saved_states_play
     group_trump.attrs['total_states_saved'] = saved_states_trump
     group_trump_with_points.attrs['total_states_saved'] = saved_states_trump
     group_time.attrs['total_states_saved'] = saved_states_time
+
 
     if not found_all_players and saved_states_play > 0:
          logging.warning(f"Finished processing {filename}, but player info might be incomplete. Saved {saved_states_play},{saved_states_time},{saved_states_trump} states.")
@@ -505,6 +520,7 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
         del hdf5_time[game_group_name]
         del hdf5_play_with_points[game_group_name]
         del hdf5_trump_with_points[game_group_name]
+        del hdf5_play_cheated[game_group_name]
         return (0, 0, 0) # Return zero states saved
     
     hdf5_play.flush()
@@ -512,6 +528,7 @@ def parse_file(file_path: str, hdf5_play: h5py.File, hdf5_trump: h5py.File, hdf5
     hdf5_time.flush()
     hdf5_play_with_points.flush()
     hdf5_trump_with_points.flush()
+    hdf5_play_cheated.flush()
     return (saved_states_play, saved_states_trump, saved_states_time)
 
 
@@ -533,10 +550,11 @@ if __name__ == "__main__":
     trump_file = os.path.join(args.output_dir, "trump.hdf5")
     time_file = os.path.join(args.output_dir, "time.hdf5")
     play_file_with_points = os.path.join(args.output_dir, "playing_with_points.hdf5")
+    play_file_cheated = os.path.join(args.output_dir, "playing_cheated.hdf5")
     trump_file_with_points = os.path.join(args.output_dir, "trump_with_points.hdf5")
 
     try:
-        with h5py.File(play_file, 'a') as hdf5_playing, h5py.File(trump_file, 'a') as hdf5_trump, h5py.File(time_file, 'a') as hdf5_time, h5py.File(play_file_with_points, 'a') as hdf5_playing_with_points, h5py.File(trump_file_with_points, 'a') as hdf5_trump_with_points:
+        with h5py.File(play_file, 'a') as hdf5_playing, h5py.File(trump_file, 'a') as hdf5_trump, h5py.File(time_file, 'a') as hdf5_time, h5py.File(play_file_with_points, 'a') as hdf5_playing_with_points, h5py.File(trump_file_with_points, 'a') as hdf5_trump_with_points, h5py.File(play_file_cheated, 'a') as hdf5_playing_cheated:
             input_files = [f for f in os.listdir(args.input_dir) if f.endswith('.game')]
             num_states_played = 0
             num_states_trump = 0
@@ -546,7 +564,7 @@ if __name__ == "__main__":
             counter = 0
             for filename in tqdm.tqdm(input_files, desc="Processing files", unit="file"):
                 file_path = os.path.join(args.input_dir, filename)
-                states_played, states_trump, states_time = parse_file(file_path, hdf5_playing, hdf5_trump, hdf5_time, hdf5_playing_with_points, hdf5_trump_with_points)
+                states_played, states_trump, states_time = parse_file(file_path, hdf5_playing, hdf5_trump, hdf5_time, hdf5_playing_with_points, hdf5_trump_with_points, hdf5_playing_cheated)
                 num_states_played += states_played
                 num_states_trump += states_trump
                 num_states_time += states_time
@@ -558,6 +576,7 @@ if __name__ == "__main__":
             hdf5_playing_with_points.attrs['total_states_saved'] = num_states_played
             hdf5_trump.attrs['total_states_saved'] = num_states_trump
             hdf5_trump_with_points.attrs['total_states_saved'] = num_states_trump
+            hdf5_playing_cheated.attrs['total_states_saved'] = num_states_played
             hdf5_time.attrs['total_states_saved'] = num_states_time
     
     except Exception as e:

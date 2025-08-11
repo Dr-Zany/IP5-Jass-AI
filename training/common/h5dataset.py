@@ -21,11 +21,11 @@ class H5Dataset(Dataset):
         self.h5file = None # will be opened in __getitem__ because it is not pickleable
         self.offset = offset
         self.length = length
-        tmp = h5py.File(path, 'r')
-        self.state_type = numpy_to_torch_dtype_dict[tmp['states'].dtype.type]
-        self.action_type = numpy_to_torch_dtype_dict[tmp['actions'].dtype.type]
-        if length is None:
-            self.length = tmp.attrs['total_states_saved']
+        with h5py.File(path, 'r') as tmp:
+            self.state_type = numpy_to_torch_dtype_dict[tmp['states'].dtype.type]
+            self.action_type = numpy_to_torch_dtype_dict[tmp['actions'].dtype.type]
+            if length is None:
+                self.length = tmp.attrs['total_states_saved']
 
     def __len__(self):
         return self.length

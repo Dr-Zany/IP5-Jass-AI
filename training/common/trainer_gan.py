@@ -51,13 +51,13 @@ class TrainerGan:
         gradient_penalty = ((gradients.norm(2, dim=1) - 1) ** 2).mean()  # scalar
         return gradient_penalty
 
-    def train(self, epochs: int, critic: ModelDNN, discriminator: ModelDNN, gen_optimizer, disc_optimizer):
+    def train(self, epochs: int, generator: ModelDNN, critic: ModelDNN, gen_optimizer, disc_optimizer):
         signal(SIGINT, self._signal_handler)
 
         for epoch in range(epochs):
-            gen_train_loss, disc_train_loss = self._train_epoch(epoch, critic, discriminator, gen_optimizer, disc_optimizer)
-            gen_val_loss, disc_val_loss = self._validate_epoch(epoch, critic, discriminator)
-            print(f"Epoch {epoch+1}/{epochs} - Generator Train Loss: {gen_train_loss:.4f}, Discriminator Train Loss: {disc_train_loss:.4f}, Generator Val Loss: {gen_val_loss:.4f}, Discriminator Val Loss: {disc_val_loss:.4f}")
+            gen_train_loss, disc_train_loss = self._train_epoch(epoch, generator, critic, gen_optimizer, disc_optimizer)
+            gen_val_loss, disc_val_loss = self._validate_epoch(epoch, generator, critic)
+            print(f"Epoch {epoch+1}/{epochs} - Generator Train Loss: {gen_train_loss:.4f}, Critic Train Loss: {disc_train_loss:.4f}, Generator Val Loss: {gen_val_loss:.4f}, Discriminator Val Loss: {disc_val_loss:.4f}")
 
             if self.stop_training:
                 print("Early stopping triggered.")

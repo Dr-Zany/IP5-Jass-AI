@@ -36,13 +36,17 @@ class JassModel:
         self.model_trump = model_trump
         self.device = device
 
-    def act(self, state: "JassState", mask: tensor) -> int:
+    def act(self, state: "JassState", mask: tensor) -> Tuple[int, tensor]: # Returns the index and gumbel-softmax action
         x = state.make_tensor().to(self.device)
+        mask = mask.to(self.device)
         logits = self.model_jass(x)
         masked_logits = logits.masked_fill(mask == 0, float('-inf'))
-        return int(F.gumbel_softmax(masked_logits, tau=1.0, hard=True).argmax(dim=-1).item())
+        fake_action = F.gumbel_softmax(masked_logits, tau=1.0, hard=True)
+        return fake_action.argmax(dim=-1).item(), fake_action
 
-    def choose_trump(self, state: "TrumpChoiceState") -> int:
+    def choose_trump(self, state: "TrumpChoiceState") -> int: 
+        """Choose a trump suit or pass.
+        will not be trained"""
         with torch.no_grad():
             x = state.make_tensor().to(self.device)
             logits = self.model_trump(x)  # [1,7]
@@ -53,14 +57,6 @@ class JassModel:
             return int(F.gumbel_softmax(masked_logits, tau=1.0, hard=True).argmax(dim=-1).item())
 
 
-@dataclass
-class Transition:
-    obs: torch.Tensor         # [72]
-    action_idx: int           # 0..8 (slot in hand)  or 0..6 during trump-choice
-    action_card: int          # 1..36 (or 0 for trump-choice)
-    next_obs: torch.Tensor    # [72]
-    done: bool
-    info: dict                # e.g., {"phase": "play"|"trump", "player": i, "legal_mask": mask(9), "trick_i": k}
 
 
 class JassState:
@@ -88,37 +84,14 @@ class TrumpChoiceState:
 
 
 class JassEnv:
-    def __init__(self, model: JassModel):
-        self.model = model
+    def __init__(self):
         self.trump_caller = 0
-
-    # ---------- Public helpers for trainer ----------
-    @staticmethod
-    def hand_from_state(state_b72: torch.Tensor) -> torch.Tensor:
-        """Extract hand slice from packed state. Layout: 32 hist | 3 table | 9 hand | 27 gewisen | 1 trump."""
-        return state_b72[:, 35:44].long()  # [B,9]
-
-    @staticmethod
-    def slot_to_card_idx0(state_b72: torch.Tensor, slot_idx_b1: torch.Tensor) -> torch.Tensor:
-        """Map slot (0..8) to global card index (0..35) using hand slice."""
-        hand = JassEnv.hand_from_state(state_b72)  # [B,9] with 1..36 or 0
-        slot = slot_idx_b1.long().clamp(min=0, max=8)
-        cards = hand.gather(1, slot)  # [B,1]
-        # fallback if empty slot (shouldn't happen for legal plays)
-        first_nonzero = (hand != 0).long().argmax(dim=1, keepdim=True)
-        cards = torch.where(cards == 0, hand.gather(1, first_nonzero), cards)
-        return cards.add(-1).clamp(min=0)
-
+    
     # ---------- Core gameplay ----------
-    def play_game(self, *, return_masks: bool = False, include_trump_steps: bool = False, seed: int | None = None):
-        if seed is not None:
-            random.seed(seed)
-            torch.manual_seed(seed)
+    def play_game(self, model: JassModel):
 
         states: List[torch.Tensor] = []
-        actions_slots: List[List[int]] = []
-        actions_cards: List[List[int]] = []
-        masks_all: List[torch.Tensor] = []
+        actions: List[torch.Tensor] = []
 
         deck = list(range(1, NUM_CARDS + 1))
         random.shuffle(deck)
@@ -127,11 +100,11 @@ class JassEnv:
         # --- Trump choice ---
         with torch.no_grad():
             tc = TrumpChoiceState(hand=hands[self.trump_caller], must_choose=0)
-            trump_choice = self.model.choose_trump(tc)  # int 0..6
+            trump_choice = model.choose_trump(tc)  # int 0..6
             if trump_choice == 0:
                 partner = (self.trump_caller + 2) % 4
                 tc2 = TrumpChoiceState(hand=hands[partner], must_choose=1)
-                trump_choice = self.model.choose_trump(tc2)  # int 1..6
+                trump_choice = model.choose_trump(tc2)  # int 1..6
 
         if trump_choice == 0:
             raise ValueError("No trump chosen, game cannot proceed.")
@@ -164,16 +137,13 @@ class JassEnv:
 
                 s_t = state.make_tensor()
                 legal_mask = self._legal_card_mask(hands[player_i], table, trump)
-                with torch.no_grad():
-                    slot_idx = self.model.act(state, legal_mask)
+                
+                slot_idx, a_t = model.act(state, legal_mask)
                 chosen_card = hands[player_i].pop(slot_idx)
 
                 # log
                 states.append(s_t)
-                actions_slots.append([slot_idx])
-                actions_cards.append([chosen_card])
-                if return_masks:
-                    masks_all.append(legal_mask)
+                actions.append(a_t)
 
                 # play
                 table.append(chosen_card)
@@ -200,14 +170,12 @@ class JassEnv:
             current_leader = winner
 
         # pack outputs
-        S = torch.cat(states, dim=0).to(torch.long)            # [T,72]
-        A_slot = torch.tensor(actions_slots, dtype=torch.long) # [T,1]
-        A_card = torch.tensor(actions_cards, dtype=torch.long) # [T,1]
+        S = torch.cat(states, dim=0).to(torch.long) # [T,72]
+        A = torch.cat(actions, dim=0).to(torch.float)  # [T,36]
 
-        if return_masks:
-            M = torch.stack([m.to(torch.uint8) for m in masks_all], dim=0) if masks_all else torch.empty((0, 9), dtype=torch.uint8)
-            return S, A_slot, A_card, M
-        return S, A_slot, A_card
+        return S, A
+
+
 
     # ---------- Rules ----------
     def _detect_weisen(self, hand: List[int], trump: int = 0, scoring: dict | None = None) -> List[int]:
@@ -343,9 +311,20 @@ class TestJassModel(JassModel):
 
 
 if __name__ == "__main__":
-    model = TestJassModel(name="Test Player")
+    #model = TestJassModel(name="Test Player")
+    JASS_MODEL_PATH = "../models/play/JassPlay_512_256_128_dnn.pth"
+    jass_model = ModelDNN(name="jass", input_size=72, embedding_size=13, hidden_size=[512, 256, 128], output_size=9)
+    jass_model.load_state_dict(torch.load(JASS_MODEL_PATH, map_location='cpu'))
+    jass_model.eval()
+    TRUMP_MODEL_PATH = "../models/trump/JassTrump_128_64_dnn.pth"
+    trump_model = ModelDNN(name="trump", input_size=10, embedding_size=13, hidden_size=[128, 64], output_size=7)
+    trump_model.load_state_dict(torch.load(TRUMP_MODEL_PATH, map_location='cpu'))
+    trump_model.eval()
+
+    model = JassModel(model_jass=jass_model, model_trump=trump_model, device='cpu')
+
     env = JassEnv(model)
-    S, A_slot, A_card = env.play_game()
+    S, A = env.play_game()
     print("Game finished.")
     print(f"States shape: {S.shape}")
-    print(f"Slot actions shape: {A_slot.shape}, Card actions shape: {A_card.shape}")
+    print(f"Actions shape: {A.shape}")

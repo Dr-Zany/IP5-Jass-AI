@@ -7,6 +7,8 @@ from .training_monitor import TrainingMonitor
 from .model_dnn import ModelDNN
 from signal import signal, getsignal, SIGINT
 from .jass_env import JassModel, JassEnv
+from itertools import islice
+
 
 # wgan-gp trainer for GANs with dynamic balancing
 class TrainerGanTrajectory:
@@ -79,7 +81,7 @@ class TrainerGanTrajectory:
 
         for epoch in range(epochs):
             gen_train_loss, disc_train_loss = self._train_epoch(epoch, critic, generator, trumper, gen_optimizer, disc_optimizer)
-            gen_val_loss, disc_val_loss = self._validate_epoch(epoch, critic, generator, trumper)
+            gen_val_loss, disc_val_loss = self._validate_epoch(epoch, generator, trumper, critic)
             print(f"Epoch {epoch+1}/{epochs} - Generator Train Loss: {gen_train_loss:.4f}, Discriminator Train Loss: {disc_train_loss:.4f}, Generator Val Loss: {gen_val_loss:.4f}, Discriminator Val Loss: {disc_val_loss:.4f}")
 
             if self.stop_training:
@@ -95,20 +97,6 @@ class TrainerGanTrajectory:
         entropy = - (topk_probs * torch.log(topk_probs + 1e-12)).sum(dim=-1)  # [B]
         return entropy.mean().item()
     
-    def _make_fake_batch(self, model, batch_size, detach=True):
-        fake_states = []
-        fake_actions_oh = []
-
-        for _ in range(batch_size):
-            fake_state, fake_action_oh = self.jass_env.play_game(model)
-            if detach:
-                fake_state = fake_state.detach()
-                fake_action_oh = fake_action_oh.detach()
-            fake_states.append(fake_state)
-            fake_actions_oh.append(fake_action_oh)
-        fake_states = torch.stack(fake_states)
-        fake_actions_oh = torch.stack(fake_actions_oh)
-        return fake_states.to(self.device), fake_actions_oh.to(self.device)
 
     def _train_epoch(self, epoch, critic, generator, trumper, gen_optimizer, disc_optimizer):
         generator.train()
@@ -128,14 +116,22 @@ class TrainerGanTrajectory:
             real_states, real_actions = state.to(self.device), action.to(self.device)
             real_actions_oh = F.one_hot(real_actions.squeeze(-1), num_classes=9).float()
 
-            # Discriminator update
-            # create fake batch using JassEnv
-            fake_states, fake_actions_oh = self._make_fake_batch(jass_model, real_states.size(0))
+            fake_states, fake_actions_oh = self.jass_env.play_game(model=jass_model, B=real_states.size(0))
+            fake_states = fake_states.to(self.device)
+            fake_actions_oh = fake_actions_oh.to(self.device)
+            disc_optimizer.zero_grad()
+            gen_optimizer.zero_grad()
 
             real_score = critic(real_states, real_actions_oh).squeeze()
-            fake_score = critic(fake_states, fake_actions_oh).squeeze()
+            fake_score = critic(fake_states.detach(), fake_actions_oh.detach()).squeeze()
 
-            gp = self._gradient_penalty(critic, real_states, real_actions_oh, fake_states, fake_actions_oh)
+            gp = self._gradient_penalty(
+                critic,
+                real_states,
+                real_actions_oh,
+                fake_states.detach(),
+                fake_actions_oh.detach(),
+            )
             disc_loss = -torch.mean(real_score) + torch.mean(fake_score) + self.lambda_gp * gp
 
             if prev_disc_loss is not None:
@@ -144,9 +140,6 @@ class TrainerGanTrajectory:
                 r_d = float('inf')
             prev_disc_loss = disc_loss.item()
 
-            # Generator update
-            gen_optimizer.zero_grad()
-            fake_states, fake_actions_oh = self._make_fake_batch(jass_model, real_states.size(0), detach=False)
             fake_output = critic(fake_states, fake_actions_oh).squeeze()
             gen_loss = -torch.mean(fake_output)
 
@@ -156,7 +149,6 @@ class TrainerGanTrajectory:
                 r_g = float('inf')
             prev_gen_loss = gen_loss.item()
 
-            # Dynamic balancing: choose the slower learning network to update
             if self.balance_lambda * r_g < r_d and gen_step * 5 >= disc_step:
                 disc_step += 1
                 disc_loss.backward()
@@ -194,24 +186,24 @@ class TrainerGanTrajectory:
 
         return avg_gen_loss, avg_disc_loss
 
-    def _validate_epoch(self, epoch, generator, discriminator):
+    def _validate_epoch(self, epoch, generator, trumper, critic):
         generator.eval()
-        discriminator.eval()
+        critic.eval()
         total_gen_loss = 0.0
         total_disc_loss = 0.0
-        total_gen_acc = 0.0
         total_disc_acc = 0.0
 
+        jass_model = JassModel(model_jass=generator, model_trump=trumper, device=self.device)
         with torch.no_grad():
             for state, action in tqdm(self.val_loader, desc=f"Validation Epoch {epoch+1}"):
-                state, action = state.to(self.device), action.to(self.device)
-                real_action_oh = F.one_hot(action.squeeze(dim=1), num_classes=9).float()
+                real_states, real_actions = state.to(self.device), action.to(self.device)
+                real_actions_oh = F.one_hot(real_actions.squeeze(-1), num_classes=9).float()
 
-                logits = generator(state)
-                fake_action_oh = F.gumbel_softmax(logits, tau=1.0, hard=True)
-
-                real_score = discriminator(state, real_action_oh).squeeze()
-                fake_score = discriminator(state, fake_action_oh).squeeze()
+                fake_states, fake_actions_oh = self.jass_env.play_game(model=jass_model, B=real_states.size(0))
+                fake_states = fake_states.to(self.device)
+                fake_actions_oh = fake_actions_oh.to(self.device)
+                real_score = critic(real_states, real_actions_oh).squeeze()
+                fake_score = critic(fake_states, fake_actions_oh).squeeze()
 
                 disc_loss = -torch.mean(real_score) + torch.mean(fake_score)
                 gen_loss = -torch.mean(fake_score)
@@ -219,17 +211,15 @@ class TrainerGanTrajectory:
                 real_pred = (real_score > 0).float()
                 fake_pred = (fake_score < 0).float()
                 disc_acc = 0.5 * (real_pred.mean().item() + fake_pred.mean().item())
-                gen_acc = logits.argmax(dim=1).eq(action).float().mean().item()
 
                 total_gen_loss += gen_loss.item()
                 total_disc_loss += disc_loss.item()
-                total_gen_acc += gen_acc
                 total_disc_acc += disc_acc
 
         avg_gen_loss = total_gen_loss / len(self.val_loader)
         avg_disc_loss = total_disc_loss / len(self.val_loader)
 
         self.monitor.on_val_epoch_end(model_name=generator.name, key='loss', value=avg_gen_loss)
-        self.monitor.on_val_epoch_end(model_name=discriminator.name, key='loss', value=avg_disc_loss)
+        self.monitor.on_val_epoch_end(model_name=critic.name, key='loss', value=avg_disc_loss)
 
         return avg_gen_loss, avg_disc_loss

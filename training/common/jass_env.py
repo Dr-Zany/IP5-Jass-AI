@@ -32,29 +32,43 @@ def is_trump(card: int, trump: int) -> bool:
 
 class JassModel:
     def __init__(self, model_jass: ModelDNN, model_trump: ModelDNN, device: str = 'cpu'):
-        self.model_jass = model_jass
-        self.model_trump = model_trump
+        self.model_jass = model_jass.to(device)
+        self.model_trump = model_trump.to(device)
         self.device = device
 
-    def act(self, state: "JassState", mask: tensor) -> Tuple[int, tensor]: # Returns the index and gumbel-softmax action
-        x = state.make_tensor().to(self.device)
+    @torch.no_grad()
+    def act(self, x: torch.Tensor, mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        x:    [B, 72]  long
+        mask: [B, 9]   bool/0-1
+        returns: (idx:[B], action:[B,9])
+        """
+        x = x.to(self.device)
         mask = mask.to(self.device)
-        logits = self.model_jass(x)
+        logits = self.model_jass(x)                 # [B,9]
         masked_logits = logits.masked_fill(mask == 0, float('-inf'))
-        fake_action = F.gumbel_softmax(masked_logits, tau=1.0, hard=True)
-        return fake_action.argmax(dim=-1).item(), fake_action
+        actions = F.gumbel_softmax(masked_logits, tau=1.0, hard=True)  # [B,9]
+        idx = actions.argmax(dim=-1)                # [B]
+        return idx, actions
 
-    def choose_trump(self, state: "TrumpChoiceState") -> int: 
-        """Choose a trump suit or pass.
-        will not be trained"""
-        with torch.no_grad():
-            x = state.make_tensor().to(self.device)
-            logits = self.model_trump(x)  # [1,7]
-            mask = torch.ones(7, dtype=torch.float, device=self.device)
-            if state.must_choose == 1:
-                mask[0] = 0
-            masked_logits = logits.masked_fill(mask == 0, float('-inf'))
-            return int(F.gumbel_softmax(masked_logits, tau=1.0, hard=True).argmax(dim=-1).item())
+    @torch.no_grad()
+    def choose_trump_batch(self, hands: torch.Tensor, must_choose: torch.Tensor) -> torch.Tensor:
+        """
+        hands:       [B, 9] long (0-padded not needed for trump; game deals 9)
+        must_choose: [B]    long {0,1}
+        returns trump choices: [B] long in {0..6}
+        """
+        x = torch.cat([hands, must_choose.view(-1,1)], dim=1).to(self.device)  # [B,10]
+        logits = self.model_trump(x)  # [B,7]
+
+        mask = torch.ones((hands.size(0), 7), dtype=torch.float, device=self.device)
+        # disable pass where must_choose==1
+        mask[must_choose.to(self.device) == 1, 0] = 0.0
+
+        masked_logits = logits.masked_fill(mask == 0, float('-inf'))
+        choice = F.gumbel_softmax(masked_logits, tau=1.0, hard=True).argmax(dim=-1)  # [B]
+        return choice
+
 
 
 
@@ -83,97 +97,163 @@ class TrumpChoiceState:
         return tensor(self.hand + [self.must_choose], dtype=torch.long).view(1, -1)
 
 
+def _pad_list(lst, target_len, pad=0):
+    return lst + [pad] * (target_len - len(lst))
+
+def _pack_state_batch(histories, tables, hands, gewisens, trumps) -> torch.Tensor:
+    """
+    histories:  list[B] of list[int] (0..32 already padded/trimmed here)
+    tables:     list[B] of list[int] (0..3 padded)
+    hands:      list[B] of list[int] (<=9 padded)
+    gewisens:   list[B] of list[int] (len 27)
+    trumps:     list[B] of int
+    returns: [B,72] long
+    """
+    B = len(hands)
+    rows = []
+    for b in range(B):
+        row = (
+            _pad_list(histories[b], 32, 0) +
+            _pad_list(tables[b], 3, 0) +
+            _pad_list(hands[b], 9, 0) +
+            gewisens[b][:] +             # already 27
+            [trumps[b]]
+        )
+        rows.append(row)
+    return torch.tensor(rows, dtype=torch.long)
+
+def _legal_mask_batch(env, hands, tables, trumps) -> torch.Tensor:
+    """
+    hands:  list[B] of list[int] (actual current hands)
+    tables: list[B] of list[int]
+    trumps: list[B] of int
+    returns: [B,9] bool
+    """
+    B = len(hands)
+    mask = torch.zeros((B, 9), dtype=torch.bool)
+    for b in range(B):
+        m = env._legal_card_mask(hands[b], tables[b], trumps[b])  # [9] bool
+        mask[b] = m
+    return mask
+
+
 class JassEnv:
     def __init__(self):
         self.trump_caller = 0
-    
-    # ---------- Core gameplay ----------
-    def play_game(self, model: JassModel):
 
-        states: List[torch.Tensor] = []
-        actions: List[torch.Tensor] = []
+    def play_game(self, model: JassModel, B: int = 1) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Runs B games in parallel with batched policy evaluation.
+        Returns:
+          S: [B, 36, 72] long
+          A: [B, 36,  9] float
+        """
+        device = model.device
 
-        deck = list(range(1, NUM_CARDS + 1))
-        random.shuffle(deck)
-        hands = [sorted(deck[i * 9:(i + 1) * 9]) for i in range(4)]
+        # outputs
+        S = torch.zeros((B, 36, 72), dtype=torch.long, device=device)
+        A = torch.zeros((B, 36, 9), dtype=torch.float, device=device)
 
-        # --- Trump choice ---
-        with torch.no_grad():
-            tc = TrumpChoiceState(hand=hands[self.trump_caller], must_choose=0)
-            trump_choice = model.choose_trump(tc)  # int 0..6
-            if trump_choice == 0:
-                partner = (self.trump_caller + 2) % 4
-                tc2 = TrumpChoiceState(hand=hands[partner], must_choose=1)
-                trump_choice = model.choose_trump(tc2)  # int 1..6
+        # ----- deal -----
+        decks = [list(range(1, NUM_CARDS + 1)) for _ in range(B)]
+        for d in decks: random.shuffle(d)
+        hands = [[sorted(decks[b][i * 9:(i + 1) * 9]) for i in range(4)] for b in range(B)]
+        initial_hands = [[h[:] for h in hands[b]] for b in range(B)]
 
-        if trump_choice == 0:
-            raise ValueError("No trump chosen, game cannot proceed.")
+        # ----- batch trump choice -----
+        callers = [self.trump_caller for _ in range(B)]
+        must_choose0 = torch.zeros(B, dtype=torch.long)
+        hands_caller = torch.tensor([hands[b][callers[b]] for b in range(B)], dtype=torch.long)
+        choice = model.choose_trump_batch(hands_caller, must_choose0)  # [B]
 
-        trump = trump_choice
+        # second pass where pass==0 occurred
+        need_partner = (choice == 0)
+        if need_partner.any():
+            partners = torch.tensor([(c + 2) % 4 for c in callers], dtype=torch.long)
+            hands_partner = torch.tensor(
+                [hands[b][partners[b].item()] for b in range(B)], dtype=torch.long
+            )
+            must_choose1 = torch.ones(B, dtype=torch.long)
+            choice2 = model.choose_trump_batch(hands_partner, must_choose1)
+            # apply only for those who passed
+            choice = torch.where(need_partner, choice2, choice)
+
+        if (choice == 0).any():
+            raise ValueError("No trump chosen for at least one game.")
+
+        trumps = choice.tolist()
+        # next leader after caller (same as single game), and advance class-level caller once
+        current_leaders = [ (callers[b] + 1) % 4 for b in range(B) ]
         self.trump_caller = (self.trump_caller + 1) % 4
 
-        history: List[int] = []
-        table: List[int] = []
+        # per-batch runtime state
+        histories = [[] for _ in range(B)]
+        tables    = [[] for _ in range(B)]
+        gewisen_all = [[[0] * 27 for _ in range(4)] for _ in range(B)]
+        has_revealed_weisen = [[False] * 4 for _ in range(B)]
 
-        initial_hands = [h[:] for h in hands]
-        gewisen_all: List[List[int]] = [[0] * 27 for _ in range(4)]
-        has_revealed_weisen = [False] * 4
-
-        current_leader = self.trump_caller
+        # ----- 9 tricks → 36 steps -----
+        step = 0
         for trick_i in range(9):
-            trick: List[int] = []
-            players_in_trick: List[int] = []
+            tricks = [[] for _ in range(B)]
+            trick_players = [[] for _ in range(B)]
 
             for turn in range(4):
-                player_i = (current_leader + turn) % 4
+                # who plays this turn (per env)
+                players = [ (current_leaders[b] + turn) % 4 for b in range(B) ]
 
-                state = JassState(
-                    history=history + [0] * (32 - len(history)),
-                    table=table + [0] * (3 - len(table)),
-                    hand=hands[player_i] + [0] * (9 - len(hands[player_i])),
-                    gewisen=gewisen_all[player_i][:],
-                    trump=trump,
-                )
+                # build batched state components
+                hands_curr = [hands[b][players[b]] for b in range(B)]
+                x = _pack_state_batch(
+                    histories=[_pad_list(histories[b], 32, 0) for b in range(B)],
+                    tables=[_pad_list(tables[b], 3, 0) for b in range(B)],
+                    hands=hands_curr,
+                    gewisens=[gewisen_all[b][players[b]][:] for b in range(B)],
+                    trumps=trumps
+                ).to(device)  # [B,72]
 
-                s_t = state.make_tensor()
-                legal_mask = self._legal_card_mask(hands[player_i], table, trump)
-                
-                slot_idx, a_t = model.act(state, legal_mask)
-                chosen_card = hands[player_i].pop(slot_idx)
+                # batched legal mask [B,9]
+                mask = _legal_mask_batch(self, hands_curr, tables, trumps).to(device)
 
-                # log
-                states.append(s_t)
-                actions.append(a_t)
+                # single batched policy call
+                idx, a = model.act(x, mask)  # idx:[B], a:[B,9]
 
-                # play
-                table.append(chosen_card)
-                trick.append(chosen_card)
-                players_in_trick.append(player_i)
+                # log outputs
+                S[:, step, :] = x
+                A[:, step, :] = a.to(torch.float)
+                step += 1
 
-                # reveal weise after first play by player
-                if not has_revealed_weisen[player_i]:
-                    has_revealed_weisen[player_i] = True
-                    weise_cards = self._detect_weisen(initial_hands[player_i], trump=trump)
-                    for viewer in range(4):
-                        if viewer == player_i:
-                            continue
-                        relative_pos = (player_i - viewer - 1) % 4
-                        if relative_pos >= 3:
-                            continue
-                        base_idx = relative_pos * 9
-                        seg = weise_cards[:9] + [0] * (9 - min(9, len(weise_cards)))
-                        gewisen_all[viewer][base_idx:base_idx + 9] = seg
+                # apply actions per env
+                for b in range(B):
+                    player_i = players[b]
+                    slot = int(idx[b].item())
+                    chosen_card = hands[b][player_i].pop(slot)
+                    tables[b].append(chosen_card)
+                    tricks[b].append(chosen_card)
+                    trick_players[b].append(player_i)
 
-            winner = self._determine_trick_winner(trick, players_in_trick, trump)
-            history.extend(trick)
-            table.clear()
-            current_leader = winner
+                    # reveal weisen after this player's first play
+                    if not has_revealed_weisen[b][player_i]:
+                        has_revealed_weisen[b][player_i] = True
+                        weise_cards = self._detect_weisen(initial_hands[b][player_i], trump=trumps[b])
+                        if weise_cards:
+                            for viewer in range(4):
+                                if viewer == player_i: continue
+                                relative_pos = (player_i - viewer - 1) % 4
+                                if relative_pos >= 3: continue
+                                base_idx = relative_pos * 9
+                                seg = weise_cards[:9] + [0] * (9 - min(9, len(weise_cards)))
+                                gewisen_all[b][viewer][base_idx:base_idx + 9] = seg
 
-        # pack outputs
-        S = torch.cat(states, dim=0).to(torch.long) # [T,72]
-        A = torch.cat(actions, dim=0).to(torch.float)  # [T,36]
+            # resolve trick winners per env
+            for b in range(B):
+                winner = self._determine_trick_winner(tricks[b], trick_players[b], trumps[b])
+                histories[b].extend(tricks[b])
+                tables[b].clear()
+                current_leaders[b] = winner
 
-        return S, A
+        return S.to(torch.long), A.to(torch.float)
+
 
 
 
@@ -323,8 +403,8 @@ if __name__ == "__main__":
 
     model = JassModel(model_jass=jass_model, model_trump=trump_model, device='cpu')
 
-    env = JassEnv(model)
-    S, A = env.play_game()
+    env = JassEnv()
+    S, A = env.play_game(model=model, B=1)
     print("Game finished.")
     print(f"States shape: {S.shape}")
     print(f"Actions shape: {A.shape}")
